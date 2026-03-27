@@ -1,0 +1,23 @@
+{
+  "name": "@opencode-go/cli",
+  "version": "1.0.0",
+  "description": "CLI to manage OpenCode Go subscription and launch Claude Code with the correct environment variables",
+  "type": "module",
+  "bin": {
+    "opencode-go": "./dist/index.js"
+  },
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target bun",
+    "dev": "bun run src/index.ts",
+    "typecheck": "bun tsc --noEmit",
+    "test": "bun test tests/helpers.test.ts tests/request-conversion.test.ts tests/response-conversion.test.ts tests/env.test.ts",
+    "start": "bun run src/index.ts"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.7.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.7.2"
+  }
+}
