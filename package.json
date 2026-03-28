@@ -4,14 +4,27 @@
   "description": "CLI to manage OpenCode Go subscription and launch Claude Code with the correct environment variables",
   "type": "module",
   "bin": {
-    "opencode-go": "./dist/index.js"
+    "opencode-go": "dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Lordymine/opencode-go-cli.git"
+  },
+  "homepage": "https://github.com/Lordymine/opencode-go-cli",
+  "bugs": {
+    "url": "https://github.com/Lordymine/opencode-go-cli/issues"
   },
   "scripts": {
     "build": "bun build src/index.ts --outdir dist --target bun",
     "dev": "bun run src/index.ts",
     "typecheck": "bun tsc --noEmit",
     "test": "bun test tests/helpers.test.ts tests/request-conversion.test.ts tests/response-conversion.test.ts tests/env.test.ts",
-    "start": "bun run src/index.ts"
+    "start": "bun run src/index.ts",
+    "prepublishOnly": "bun run build"
   },
   "dependencies": {
     "@clack/prompts": "^0.7.0",

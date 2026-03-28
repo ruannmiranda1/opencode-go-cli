@@ -212,18 +212,25 @@ opencode-go --help
 
 **Requirements:**
 
-- [Bun](https://bun.sh) runtime
+- [Bun](https://bun.sh) runtime (required to run `opencode-go`)
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and in PATH
 - **OpenCode Go:** API key from your OpenCode Go subscription
 - **OpenAI:** ChatGPT Plus/Pro subscription (for OAuth)
 
-**Install global command:**
+**Install globally (recommended):**
 
 ```bash
-bun run build && bun install -g .
+bun install -g @opencode-go/cli
 ```
 
-Isso cria o comando `opencode-go` disponível em qualquer terminal (sem precisar de `bun run`).
+O pacote é publicado no npm, mas o runtime oficial do CLI é Bun. O comando recomendado de instalação global é `bun install -g @opencode-go/cli`.
+
+**For local development only:**
+
+```bash
+bun run build
+bun link
+```
 
 **Quick Start — OpenCode Go:**
 
@@ -260,7 +267,7 @@ Config is stored at `~/.opencode-go-cli/config.json`:
 ## Development
 
 ```bash
-opencode-go                   # After global install (recommended)
+opencode-go                   # After global install with Bun
 bun run src/index.ts          # Without global install
 bun run build                 # Build to dist/
 bun run typecheck             # TypeScript check
