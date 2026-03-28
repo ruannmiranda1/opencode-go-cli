@@ -486,7 +486,8 @@ export async function main(): Promise<void> {
   }
 
   if (args.includes("--version") || args.includes("-v")) {
-    console.log("opencode-go v1.0.0");
+    const packageJson = await Bun.file(new URL("../package.json", import.meta.url)).json() as { version?: string };
+    console.log(`opencode-go v${packageJson.version ?? "0.0.0"}`);
     process.exit(0);
   }
 
@@ -548,7 +549,7 @@ export async function main(): Promise<void> {
       console.error("[cli] No API key configured. Run 'opencode-go --setup' first.");
       process.exit(1);
     }
-    await startProxy(port, provider);
+    await startProxy(port, provider, PROXY_PORT_FALLBACK_ATTEMPTS);
     await new Promise(() => {}) as Promise<never>;
     return;
   }

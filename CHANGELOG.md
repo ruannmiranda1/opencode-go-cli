@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [1.0.3] - 2026-03-28
+
+### Fixed
+- Corrected the published CLI so `opencode-go --version` reports the package version instead of a hardcoded `1.0.0` string.
+- Enabled sequential proxy port fallback in `--proxy` mode so new CLI sessions continue on the next free local port instead of stopping at `EADDRINUSE`.
+- Rebuilt the distributable package so the published `dist/index.js` matches the repository source for release `1.0.3`.
+
 ## [1.0.2] - 2026-03-28
 
 ### Fixed
