@@ -60,7 +60,7 @@ main()
   │     ├── selectModel() → lista de modelos do provider
   │     └── selectPermissionMode() → default/acceptEdits/auto/bypassPermissions
   ├── startFlow()
-  │     ├── startProxy() — sobe Bun.serve na porta 8080 (default)
+  │     ├── startProxy() — tenta a porta preferida/default e faz fallback para a próxima livre no modo interativo
   │     ├── silenceLogger() — silencia logs pro terminal
   │     ├── buildPermissionArgs() — converte mode em flags do Claude Code
   │     └── runClaudeCode()

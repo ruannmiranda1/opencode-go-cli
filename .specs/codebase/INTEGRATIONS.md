@@ -107,7 +107,7 @@ const claudePath = resolveClaudePath(); // "where claude" ou "which claude"
 
 // buildClaudeEnv constrói as variáveis
 const env = buildClaudeEnv(config.apiKey, model, proxyUrl);
-// proxyUrl = http://localhost:8080 (ou porta configurada)
+// proxyUrl = http://localhost:<porta-final> (porta preferida/configurada, com fallback automático no modo interativo)
 
 // Spinner enquanto inicia
 const spinner = p.spinner();
@@ -187,6 +187,8 @@ spinner.stop("Done!");
   "lastModel": "minimax-m2.7",
   "proxyPort": 8080
 }
+
+`proxyPort` representa a porta preferida do proxy local. No modo interativo, a porta efetiva pode avançar para a próxima livre quando houver conflito.
 ```
 
 **Operações (`src/config.ts`):**

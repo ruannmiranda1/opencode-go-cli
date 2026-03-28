@@ -9,6 +9,7 @@ import {
   MODELS,
   OPENAI_MODELS,
   DEFAULT_PROXY_PORT,
+  PROXY_PORT_FALLBACK_ATTEMPTS,
   PROVIDERS,
   type Provider,
 } from "./constants.js";
@@ -361,8 +362,7 @@ async function startFlow(
   const config = getConfig();
   config.provider = provider;
   config.lastModel = model;
-  const port = portOverride ?? config.proxyPort ?? DEFAULT_PROXY_PORT;
-  config.proxyPort = port;
+  const preferredPort = portOverride ?? config.proxyPort ?? DEFAULT_PROXY_PORT;
   saveConfig(config);
 
   // 6. Resolve auth token
@@ -372,8 +372,8 @@ async function startFlow(
     : freshConfig.apiKey!;
 
   // 7. Start proxy + Claude Code
-  const proxyUrl = `http://localhost:${port}`;
-  await startProxy(port, provider);
+  const proxyPort = await startProxy(preferredPort, provider, PROXY_PORT_FALLBACK_ATTEMPTS);
+  const proxyUrl = `http://localhost:${proxyPort}`;
   silenceLogger();
 
   const permArgs = buildPermissionArgs(permMode);
@@ -450,7 +450,7 @@ Options:
   --reset                   Delete all configuration
   --list                    List available models
   --proxy                   Start proxy server only (for testing)
-  --port <port>             Proxy port (default: ${DEFAULT_PROXY_PORT})
+  --port <port>             Proxy port (interactive mode auto-falls back; --proxy defaults to ${DEFAULT_PROXY_PORT})
   --version, -v             Show version
   --help, -h                Show this help
 

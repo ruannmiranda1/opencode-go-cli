@@ -21,7 +21,16 @@ import { ensureSearXNG } from "../search/searxng.js";
 
 const logger = createLogger("[proxy]");
 
-export async function startProxy(port: number, provider: Provider): Promise<void> {
+function isPortInUseError(err: any): boolean {
+  return err?.code === "EADDRINUSE" || err?.message?.includes("address already in use");
+}
+
+function formatPortRange(startPort: number, attempts: number): string {
+  const endPort = startPort + attempts - 1;
+  return attempts === 1 ? `${startPort}` : `${startPort}-${endPort}`;
+}
+
+export async function startProxy(port: number, provider: Provider, attempts = 1): Promise<number> {
   const config = getConfig();
   const endpoint = provider === "openai" ? CODEX_API_URL : OPENCODE_GO_ENDPOINT;
 
@@ -57,214 +66,232 @@ export async function startProxy(port: number, provider: Provider): Promise<void
   }
 
   let server;
-  try {
-    server = Bun.serve({
-      port,
-      async fetch(req) {
-        const url = new URL(req.url);
-        logger.debug(`${req.method} ${url.pathname}`);
+  let boundPort: number | undefined;
 
-        // Claude Code sends HEAD / to check connectivity
-        if (req.method === "HEAD" || req.method === "GET") {
-          return new Response("OK", { status: 200 });
-        }
+  for (let attempt = 0; attempt < attempts; attempt++) {
+    const candidatePort = port + attempt;
+    try {
+      server = Bun.serve({
+        port: candidatePort,
+        async fetch(req) {
+          const url = new URL(req.url);
+          logger.debug(`${req.method} ${url.pathname}`);
 
-        if (req.method !== "POST") {
-          return new Response("Method not allowed", { status: 405 });
-        }
+          // Claude Code sends HEAD / to check connectivity
+          if (req.method === "HEAD" || req.method === "GET") {
+            return new Response("OK", { status: 200 });
+          }
 
-        if (url.pathname === "/v1/messages") {
-          try {
-            const anthropicBody = await req.json() as any;
-            const isStreaming = anthropicBody.stream === true;
-            logger.debug(`Model: ${anthropicBody.model} | stream: ${isStreaming} | tools: ${anthropicBody.tools?.length ?? 0}`);
+          if (req.method !== "POST") {
+            return new Response("Method not allowed", { status: 405 });
+          }
 
-            // Intercept WebSearch server tool requests
-            if (hasWebSearchTool(anthropicBody)) {
-              logger.info("Intercepting WebSearch request");
-              return await handleWebSearch(anthropicBody);
-            }
+          if (url.pathname === "/v1/messages") {
+            try {
+              const anthropicBody = await req.json() as any;
+              const isStreaming = anthropicBody.stream === true;
+              logger.debug(`Model: ${anthropicBody.model} | stream: ${isStreaming} | tools: ${anthropicBody.tools?.length ?? 0}`);
 
-            const isResponses = provider === "openai";
-            const outBody = isResponses
-              ? convertAnthropicRequestToResponses(anthropicBody)
-              : convertAnthropicRequestToOpenAI(anthropicBody);
+              // Intercept WebSearch server tool requests
+              if (hasWebSearchTool(anthropicBody)) {
+                logger.info("Intercepting WebSearch request");
+                return await handleWebSearch(anthropicBody);
+              }
 
-            logger.debug(`→ ${endpoint} (${isResponses ? "Responses API" : "Chat Completions"})`);
-            logger.debug(`Request body: ${JSON.stringify(outBody).slice(0, 2000)}`);
+              const isResponses = provider === "openai";
+              const outBody = isResponses
+                ? convertAnthropicRequestToResponses(anthropicBody)
+                : convertAnthropicRequestToOpenAI(anthropicBody);
 
-            const response = await fetch(endpoint, {
-              method: "POST",
-              headers: {
-                "Authorization": `Bearer ${accessToken}`,
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify(outBody),
-            });
+              logger.debug(`→ ${endpoint} (${isResponses ? "Responses API" : "Chat Completions"})`);
+              logger.debug(`Request body: ${JSON.stringify(outBody).slice(0, 2000)}`);
 
-            logger.info(`← status ${response.status}`);
-
-            if (!response.ok) {
-              const errorText = await response.text();
-              logger.error(`API error: ${errorText.slice(0, 500)}`);
-              return new Response(JSON.stringify({
-                type: "error",
-                error: {
-                  type: "api_error",
-                  message: errorText,
+              const response = await fetch(endpoint, {
+                method: "POST",
+                headers: {
+                  "Authorization": `Bearer ${accessToken}`,
+                  "Content-Type": "application/json",
                 },
-              }), {
-                status: response.status,
-                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(outBody),
               });
-            }
 
-            // Codex backend always requires stream=true, so for OpenAI provider
-            // we always get a streaming response even if Claude Code asked for non-streaming.
-            // In that case, we consume the stream and return a non-streaming Anthropic response.
-            const upstreamIsStreaming = isResponses ? true : isStreaming;
+              logger.info(`← status ${response.status}`);
 
-            if (upstreamIsStreaming) {
-              const streamGenerator = isResponses
-                ? streamResponsesToAnthropic(response)
-                : streamOpenAIToAnthropic(response);
-
-              if (isStreaming) {
-                // Client wants streaming: pass through
-                const stream = new ReadableStream({
-                  async start(controller) {
-                    let chunkCount = 0;
-                    try {
-                      for await (const chunk of streamGenerator) {
-                        chunkCount++;
-                        if (chunkCount <= 5) {
-                          logger.debug(`SSE chunk #${chunkCount}: ${chunk.slice(0, 200).replace(/\n/g, "\\n")}`);
-                        }
-                        controller.enqueue(new TextEncoder().encode(chunk));
-                      }
-                      logger.debug(`Stream complete: ${chunkCount} chunks sent`);
-                    } catch (e) {
-                      logger.error(`Stream error: ${e}`);
-                    } finally {
-                      controller.close();
-                    }
+              if (!response.ok) {
+                const errorText = await response.text();
+                logger.error(`API error: ${errorText.slice(0, 500)}`);
+                return new Response(JSON.stringify({
+                  type: "error",
+                  error: {
+                    type: "api_error",
+                    message: errorText,
                   },
-                });
-
-                return new Response(stream, {
-                  status: 200,
-                  headers: {
-                    "Content-Type": "text/event-stream",
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                  },
-                });
-              } else {
-                // Client wants non-streaming but upstream is streaming (Codex):
-                // consume stream, collect text/tool blocks, return as JSON
-                let fullText = "";
-                const toolUses: any[] = [];
-                const toolArgs: Record<number, string> = {};
-                let stopReason = "end_turn";
-
-                for await (const chunk of streamGenerator) {
-                  // Parse SSE events from our own generator output
-                  const lines = chunk.split("\n");
-                  for (const line of lines) {
-                    if (!line.startsWith("data: ")) continue;
-                    const dataStr = line.slice(6);
-                    try {
-                      const evt = JSON.parse(dataStr);
-                      if (evt.type === "content_block_start" && evt.content_block?.type === "text") {
-                        // text block starting
-                      } else if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
-                        fullText += evt.delta.text;
-                      } else if (evt.type === "content_block_start" && evt.content_block?.type === "tool_use") {
-                        toolUses.push({
-                          type: "tool_use",
-                          id: evt.content_block.id,
-                          name: evt.content_block.name,
-                          input: {},
-                        });
-                        toolArgs[evt.index] = "";
-                      } else if (evt.type === "content_block_delta" && evt.delta?.type === "input_json_delta") {
-                        toolArgs[evt.index] = (toolArgs[evt.index] ?? "") + evt.delta.partial_json;
-                      } else if (evt.type === "message_delta" && evt.delta?.stop_reason) {
-                        stopReason = evt.delta.stop_reason;
-                      }
-                    } catch {}
-                  }
-                }
-
-                // Parse accumulated tool args
-                for (const tu of toolUses) {
-                  const idx = toolUses.indexOf(tu);
-                  const rawArgs = Object.values(toolArgs).find((_, i) => i === idx);
-                  if (rawArgs) {
-                    try { tu.input = JSON.parse(rawArgs); } catch {}
-                  }
-                }
-
-                const content: any[] = [];
-                if (fullText) content.push({ type: "text", text: fullText });
-                content.push(...toolUses);
-
-                const anthropicResponse = {
-                  id: `msg_${Math.random().toString(36).substring(2, 15)}`,
-                  type: "message",
-                  role: "assistant",
-                  content,
-                  model: anthropicBody.model ?? "",
-                  stop_reason: stopReason,
-                  stop_sequence: null,
-                  usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
-                };
-
-                logger.debug(`Response (collected): stop_reason=${stopReason}, blocks=${content.length}`);
-                return new Response(JSON.stringify(anthropicResponse), {
-                  status: 200,
+                }), {
+                  status: response.status,
                   headers: { "Content-Type": "application/json" },
                 });
               }
+
+              // Codex backend always requires stream=true, so for OpenAI provider
+              // we always get a streaming response even if Claude Code asked for non-streaming.
+              // In that case, we consume the stream and return a non-streaming Anthropic response.
+              const upstreamIsStreaming = isResponses ? true : isStreaming;
+
+              if (upstreamIsStreaming) {
+                const streamGenerator = isResponses
+                  ? streamResponsesToAnthropic(response)
+                  : streamOpenAIToAnthropic(response);
+
+                if (isStreaming) {
+                  // Client wants streaming: pass through
+                  const stream = new ReadableStream({
+                    async start(controller) {
+                      let chunkCount = 0;
+                      try {
+                        for await (const chunk of streamGenerator) {
+                          chunkCount++;
+                          if (chunkCount <= 5) {
+                            logger.debug(`SSE chunk #${chunkCount}: ${chunk.slice(0, 200).replace(/\n/g, "\\n")}`);
+                          }
+                          controller.enqueue(new TextEncoder().encode(chunk));
+                        }
+                        logger.debug(`Stream complete: ${chunkCount} chunks sent`);
+                      } catch (e) {
+                        logger.error(`Stream error: ${e}`);
+                      } finally {
+                        controller.close();
+                      }
+                    },
+                  });
+
+                  return new Response(stream, {
+                    status: 200,
+                    headers: {
+                      "Content-Type": "text/event-stream",
+                      "Cache-Control": "no-cache",
+                      "Connection": "keep-alive",
+                    },
+                  });
+                } else {
+                  // Client wants non-streaming but upstream is streaming (Codex):
+                  // consume stream, collect text/tool blocks, return as JSON
+                  let fullText = "";
+                  const toolUses: any[] = [];
+                  const toolArgs: Record<number, string> = {};
+                  let stopReason = "end_turn";
+
+                  for await (const chunk of streamGenerator) {
+                    // Parse SSE events from our own generator output
+                    const lines = chunk.split("\n");
+                    for (const line of lines) {
+                      if (!line.startsWith("data: ")) continue;
+                      const dataStr = line.slice(6);
+                      try {
+                        const evt = JSON.parse(dataStr);
+                        if (evt.type === "content_block_start" && evt.content_block?.type === "text") {
+                          // text block starting
+                        } else if (evt.type === "content_block_delta" && evt.delta?.type === "text_delta") {
+                          fullText += evt.delta.text;
+                        } else if (evt.type === "content_block_start" && evt.content_block?.type === "tool_use") {
+                          toolUses.push({
+                            type: "tool_use",
+                            id: evt.content_block.id,
+                            name: evt.content_block.name,
+                            input: {},
+                          });
+                          toolArgs[evt.index] = "";
+                        } else if (evt.type === "content_block_delta" && evt.delta?.type === "input_json_delta") {
+                          toolArgs[evt.index] = (toolArgs[evt.index] ?? "") + evt.delta.partial_json;
+                        } else if (evt.type === "message_delta" && evt.delta?.stop_reason) {
+                          stopReason = evt.delta.stop_reason;
+                        }
+                      } catch {}
+                    }
+                  }
+
+                  // Parse accumulated tool args
+                  for (const tu of toolUses) {
+                    const idx = toolUses.indexOf(tu);
+                    const rawArgs = Object.values(toolArgs).find((_, i) => i === idx);
+                    if (rawArgs) {
+                      try { tu.input = JSON.parse(rawArgs); } catch {}
+                    }
+                  }
+
+                  const content: any[] = [];
+                  if (fullText) content.push({ type: "text", text: fullText });
+                  content.push(...toolUses);
+
+                  const anthropicResponse = {
+                    id: `msg_${Math.random().toString(36).substring(2, 15)}`,
+                    type: "message",
+                    role: "assistant",
+                    content,
+                    model: anthropicBody.model ?? "",
+                    stop_reason: stopReason,
+                    stop_sequence: null,
+                    usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+                  };
+
+                  logger.debug(`Response (collected): stop_reason=${stopReason}, blocks=${content.length}`);
+                  return new Response(JSON.stringify(anthropicResponse), {
+                    status: 200,
+                    headers: { "Content-Type": "application/json" },
+                  });
+                }
+              }
+
+              // Non-streaming (Chat Completions only, OpenCode Go)
+              const data = await response.json() as any;
+              const anthropicResponse = convertOpenAIResponseToAnthropic(data);
+              logger.debug(`Response: stop_reason=${anthropicResponse.stop_reason}, blocks=${anthropicResponse.content.length}`);
+
+              return new Response(JSON.stringify(anthropicResponse), {
+                status: 200,
+                headers: { "Content-Type": "application/json" },
+              });
+            } catch (e: any) {
+              logger.error(`Internal error: ${e.message}`);
+              return new Response(JSON.stringify({
+                type: "error",
+                error: {
+                  type: "internal_server_error",
+                  message: e.message,
+                },
+              }), {
+                status: 500,
+                headers: { "Content-Type": "application/json" },
+              });
             }
-
-            // Non-streaming (Chat Completions only, OpenCode Go)
-            const data = await response.json() as any;
-            const anthropicResponse = convertOpenAIResponseToAnthropic(data);
-            logger.debug(`Response: stop_reason=${anthropicResponse.stop_reason}, blocks=${anthropicResponse.content.length}`);
-
-            return new Response(JSON.stringify(anthropicResponse), {
-              status: 200,
-              headers: { "Content-Type": "application/json" },
-            });
-          } catch (e: any) {
-            logger.error(`Internal error: ${e.message}`);
-            return new Response(JSON.stringify({
-              type: "error",
-              error: {
-                type: "internal_server_error",
-                message: e.message,
-              },
-            }), {
-              status: 500,
-              headers: { "Content-Type": "application/json" },
-            });
           }
-        }
 
-        return new Response("Not found", { status: 404 });
-      },
-    });
-  } catch (err: any) {
-    if (err.code === "EADDRINUSE" || err.message?.includes("address already in use")) {
-      logger.error(`Port ${port} is already in use. Use --port to specify a different port.`);
-    } else {
-      logger.error(`Failed to start proxy: ${err.message}`);
+          return new Response("Not found", { status: 404 });
+        },
+      });
+      boundPort = server.port;
+      break;
+    } catch (err: any) {
+      if (isPortInUseError(err) && attempt < attempts - 1) {
+        logger.warn(`Port ${candidatePort} is already in use. Trying ${candidatePort + 1}...`);
+        continue;
+      }
+
+      if (isPortInUseError(err)) {
+        throw new Error(`No available proxy port in range ${formatPortRange(port, attempts)}.`);
+      }
+
+      throw err;
     }
-    process.exit(1);
   }
 
-  logger.info(`Proxy ready at http://localhost:${server.port}`);
+  if (boundPort === undefined) {
+    throw new Error(`Failed to start proxy on port range ${formatPortRange(port, attempts)}.`);
+  }
+
+  if (boundPort !== port) {
+    logger.info(`Preferred port ${port} unavailable, using ${boundPort}`);
+  }
+  logger.info(`Proxy ready at http://localhost:${boundPort}`);
   logger.info("Waiting for Claude Code...");
 
   // Start SearXNG in background for WebSearch interception
@@ -272,4 +299,6 @@ export async function startProxy(port: number, provider: Provider): Promise<void
     if (ok) logger.info("WebSearch interception enabled (SearXNG)");
     else logger.warn("WebSearch interception disabled (SearXNG unavailable)");
   });
+
+  return boundPort;
 }

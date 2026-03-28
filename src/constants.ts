@@ -69,6 +69,7 @@ export const CONFIG_FILE = join(CONFIG_DIR, "config.json");
 export const INSTALLATIONS_DIR = join(CONFIG_DIR, "installations");
 export const DEFAULT_INSTALLATION_ID = "default";
 export const DEFAULT_PROXY_PORT = 8080;
+export const PROXY_PORT_FALLBACK_ATTEMPTS = 20;
 
 export const PRESERVED_CLAUDE_CODE_VARS = new Set([
   "CLAUDE_CODE_GIT_BASH_PATH",

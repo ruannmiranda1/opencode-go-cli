@@ -16,7 +16,8 @@ bun test                      # Suite de testes (49 testes)
 opencode-go --setup           # Setup inicial
 opencode-go --oauth-login     # Login OpenAI via OAuth
 opencode-go --oauth-logout    # Remove tokens OpenAI
-opencode-go --proxy --port 8080  # Modo proxy isolado
+opencode-go --proxy --port 8080  # Modo proxy isolado (porta explícita)
+opencode-go                       # Modo interativo com fallback automático de porta
 opencode-go --permission-mode acceptEdits  # Com modo de permissão
 opencode-go --dangerously-skip-permissions  # Bypass de permissões
 ```
@@ -25,9 +26,9 @@ opencode-go --dangerously-skip-permissions  # Bypass de permissões
 
 ### O CLI é modular — dois modos de operação
 
-**Modo interativo (padrão):** menu Start/Settings → Provider (OpenCode Go / OpenAI) → Model → Permission Mode → lança Claude Code com as variáveis de ambiente setadas (o proxy é iniciado automaticamente).
+**Modo interativo (padrão):** menu Start/Settings → Provider (OpenCode Go / OpenAI) → Model → Permission Mode → tenta subir o proxy na porta preferida/default e, se ela estiver ocupada, faz fallback automático para a próxima porta livre antes de lançar o Claude Code.
 
-**Modo proxy (`--proxy`):** sobe um servidor HTTP na porta 8080 que traduz requisições Anthropic ↔ OpenAI. O Claude Code aponta pra esse proxy via `ANTHROPIC_BASE_URL`.
+**Modo proxy (`--proxy`):** sobe um servidor HTTP em uma porta explícita/configurada (ex.: `--port 8080`) que traduz requisições Anthropic ↔ OpenAI. O Claude Code aponta pra esse proxy via `ANTHROPIC_BASE_URL`.
 
 ### Fluxo interativo
 
@@ -39,7 +40,7 @@ opencode-go (sem args)
         → Auth check (API key ou OAuth)
         → Select model
         → Select permission mode (default / acceptEdits / auto / bypassPermissions)
-        → Start proxy + launch Claude Code
+        → Start proxy (porta preferida com fallback automático) + launch Claude Code
     → Settings:
         → Set API key / Login OpenAI / Logout OpenAI / Reset all
 ```
@@ -137,7 +138,7 @@ O SearXNG roda como container Docker (`opencode-searxng`, porta 8888). É inicia
 
 ### Config
 
-`~/.opencode-go-cli/config.json` — guarda apiKey, provider, openaiTokens, lastModel e proxyPort.
+`~/.opencode-go-cli/config.json` — guarda apiKey, provider, openaiTokens, lastModel e proxyPort. `proxyPort` é a porta preferida do proxy local; no modo interativo, a porta efetiva pode mudar se houver conflito.
 
 Diretório `~/.opencode-go-cli/searxng/settings.yml` — settings do SearXNG (gerado automaticamente).
 

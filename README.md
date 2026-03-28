@@ -204,6 +204,9 @@ opencode-go --list --provider opencode    Show OpenCode Go models
 # Proxy-only mode (for testing)
 opencode-go --proxy --port 8080
 
+# Interactive mode auto-selects the next free local proxy port if the preferred port is busy
+opencode-go --model minimax-m2.7
+
 # Help
 opencode-go --help
 ```
@@ -250,6 +253,8 @@ opencode-go --provider openai --model gpt-5.2-codex
 
 Config is stored at `~/.opencode-go-cli/config.json`:
 
+`proxyPort` is the preferred local proxy port. In normal interactive mode, if that port is already in use, the CLI automatically tries the next free port and injects the final URL into Claude Code.
+
 ```json
 {
   "provider": "opencode",
@@ -275,6 +280,8 @@ bun test                      # Test suite (49 tests)
 ```
 
 **Proxy-only testing (with API key in config):**
+
+Interactive mode auto-falls back to the next free port. `--proxy` remains explicit/predictable: use `--port` to force a specific port, or omit it to use the configured/default preferred port.
 
 ```bash
 # Without DEBUG (quiet)
