@@ -41,26 +41,35 @@ src/
 ├── config.ts           — persistência (deps: constants)
 ├── path.ts            — resolução de binário (deps: constants)
 ├── env.ts             — buildClaudeEnv (deps: constants)
-├── logger.ts          — logging configurável (deps: constants)
-├── cli.ts             — orchestration (importa tudo)
+├── logger.ts          — logging configurável + file output (sem deps externas)
+├── cli.ts             — orchestration + menus + permission modes (importa tudo)
+├── auth/
+│   ├── oauth.ts       — PKCE, exchange, refresh
+│   └── server.ts      — callback server
+├── search/
+│   └── searxng.ts     — Docker SearXNG management + search
 └── proxy/
     ├── types.ts        — interfaces (sem deps)
     ├── helpers.ts      — funções puras utilitárias (sem deps)
+    ├── websearch-interceptor.ts — WebSearch interception via SearXNG
     ├── request-conversion.ts
     ├── response-conversion.ts
     ├── stream-conversion.ts
-    └── server.ts       — Bun.serve (deps: proxy modules + logger)
+    ├── *-responses.ts  — Responses API conversions (OpenAI/Codex)
+    └── server.ts       — Bun.serve (deps: proxy modules + logger + websearch + searxng)
 ```
 
 ## Type Safety
 
 **Approach:** TypeScript com strict mode, sem JSDoc.
 
-Interfaces definidas em `src/proxy/types.ts`:
+Interfaces definidas em `src/constants.ts`:
 
 ```typescript
 export interface Config {
   apiKey?: string;
+  provider?: Provider;
+  openaiTokens?: OpenAIAuthTokens;
   lastModel?: string;
   proxyPort?: number;
 }
@@ -70,6 +79,18 @@ export interface Model {
   name: string;
   description: string;
 }
+
+export interface OpenAIAuthTokens {
+  access: string;
+  refresh: string;
+  expiresAt: number;
+}
+```
+
+Type local em `src/cli.ts`:
+
+```typescript
+type PermissionMode = "default" | "acceptEdits" | "auto" | "bypassPermissions";
 ```
 
 **Parâmetros de função com `any`:** Os módulos de conversão usam `any` para o body de request/response da API (tipos não estão definidos). Isso é aceitável porque a API upstream não é tipada.

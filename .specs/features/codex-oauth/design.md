@@ -183,20 +183,20 @@ Converte Responses API SSE → Anthropic SSE:
 - `response.output_item.added` (function_call) → `content_block_start` (tool_use)
 - `response.completed` → `message_delta` + `message_stop`
 
-### Novo: `src/cli-oauth.ts`
+### OAuth em `src/cli.ts`
 
-Comando de OAuth standalone:
+O fluxo OAuth está integrado diretamente em `src/cli.ts` (não existe `src/cli-oauth.ts` separado):
 
 ```bash
 opencode-go --oauth-login
 ```
 
-Fluxo completo:
-1. Gera PKCE + state
-2. Sobe servidor em 1455
+Fluxo completo (em `setupOpenAIOAuth()`):
+1. Gera PKCE + state via `createAuthorizationFlow()`
+2. Sobe servidor em 1455 via `startLocalOAuthServer()`
 3. Abre navegador com URL de autorização
-4. Polls até receber código
-5. Troca código por tokens
+4. `waitForCode()` aguarda callback
+5. Troca código por tokens via `exchangeAuthorizationCode()`
 6. Salva no config
 
 ---

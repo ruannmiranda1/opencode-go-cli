@@ -32,11 +32,40 @@ The goal is to make it work with OpenCode Go — transparently.
 - **Tool call support** — `tool_use` and `tool_result` blocks are mapped correctly
 - **Image support** — `image` content blocks converted to `data:` URIs
 - **Two providers** — OpenCode Go (API key) or OpenAI via OAuth (ChatGPT Plus/Pro)
+- **Interactive menu** — Provider → Model → Permission Mode flow with settings menu
+- **4 permission modes** — default, acceptEdits, auto, bypassPermissions
+- **WebSearch interception** — `web_search` server tool requests executed locally via SearXNG Docker container
 - **Model selection** — interactive or `--model` flag, 10 models available
 - **Persistent config** — API key / OAuth tokens and last model stored in `~/.opencode-go-cli/`
 - **Sub-agent compatibility** — all sub-agents use the same model via environment variables
 - **Fail-fast validation** — invalid models caught before proxy starts
 - **Automatic token refresh** — OAuth tokens renewed automatically
+
+## Interactive Menu
+
+When launched without arguments, the CLI shows an interactive menu:
+
+```
+opencode-go
+  → "What do you want to do?" → Start / Settings
+    → Start:
+        → Select provider (OpenCode Go / OpenAI)
+        → Auth check (API key or OAuth)
+        → Select model
+        → Select permission mode
+        → Start proxy + launch Claude Code
+    → Settings:
+        → Set API key / Login OpenAI / Logout OpenAI / Reset all
+```
+
+## Permission Modes
+
+| Mode | Behavior |
+|------|----------|
+| `default` | Asks permission for everything |
+| `acceptEdits` | Auto-approves file edits, asks for commands |
+| `auto` | Classifier reviews actions (experimental) |
+| `bypassPermissions` | Skips all permission checks |
 
 ## Runtime Model
 
@@ -44,12 +73,14 @@ The CLI runs in two stages:
 
 ```
 Stage 1: CLI (opencode-go)
-  └─ Validates model
+  └─ Interactive menu (provider → model → permission mode)
   └─ Starts proxy on localhost:PORT
+  └─ Starts SearXNG Docker container (background, for WebSearch)
   └─ Spawns Claude Code with ANTHROPIC_BASE_URL=http://localhost:PORT
 
 Stage 2: Proxy (localhost:PORT)
   └─ Receives POST /v1/messages (Anthropic format)
+  └─ Intercepts web_search server tool requests → SearXNG
   └─ Routes based on provider:
        ├─ OpenCode Go: Chat Completions API (/v1/chat/completions)
        └─ OpenAI:      Responses API (/backend-api/codex/responses)
@@ -93,25 +124,28 @@ Claude Code → POST /v1/messages (Anthropic)
 ```text
 src/
 ├── index.ts                 Thin entry point (shebang + main export)
-├── cli.ts                  Argument parsing, interactive prompts, Claude Code spawn
+├── cli.ts                  Interactive menus, permission modes, Claude Code spawn
 ├── constants.ts            MODELS, OPENAI_MODELS, PROVIDERS, OAuth constants
 ├── config.ts               getConfig, saveConfig, deleteConfig
 ├── path.ts                 resolveClaudePath (claude binary in PATH)
 ├── env.ts                  buildClaudeEnv, cleanupClaudeCodeVars
-├── logger.ts               createLogger (DEBUG/INFO/WARN/ERROR) + silenceLogger()
+├── logger.ts               createLogger (DEBUG/INFO/WARN/ERROR) + silenceLogger() + file logging
 ├── auth/
 │   ├── oauth.ts           PKCE, exchange, refresh, JWT decode
 │   └── server.ts          Local HTTP server for OAuth callback
+├── search/
+│   └── searxng.ts         SearXNG Docker container management + search queries
 └── proxy/
     ├── types.ts                          Config, Model interfaces
-    ├── helpers.ts                        mapStopReason, generateMsgId, convertImageSource
+    ├── helpers.ts                        mapStopReason, generateMsgId, convertImageSource, makeSSE
+    ├── websearch-interceptor.ts          WebSearch server tool interception via SearXNG
     ├── request-conversion.ts             Anthropic → Chat Completions (OpenCode Go)
     ├── response-conversion.ts            Chat Completions → Anthropic (OpenCode Go)
     ├── stream-conversion.ts              Chat Completions SSE → Anthropic SSE (OpenCode Go)
     ├── request-conversion-responses.ts   Anthropic → Responses API (OpenAI/Codex)
     ├── response-conversion-responses.ts  Responses API → Anthropic (OpenAI/Codex)
     ├── stream-conversion-responses.ts    Responses API SSE → Anthropic SSE (OpenAI/Codex)
-    └── server.ts                         Bun.serve + dual routing
+    └── server.ts                         Bun.serve + dual routing + WebSearch interception
 
 tests/
 ├── helpers.test.ts
@@ -146,31 +180,26 @@ tests/
 ## CLI
 
 ```bash
-# OpenCode Go (default — API key)
-opencode-go --model minimax-m2.7
-
-# OpenAI via OAuth (ChatGPT Plus/Pro)
-opencode-go --oauth-login
-opencode-go --provider openai --model gpt-5.2-codex
-
-# Interactive mode (select model)
+# Interactive mode (full menu: provider → model → permission mode)
 opencode-go
 
-# With Claude Code flags
-opencode-go --model minimax-m2.7 -p "explain this code"
-opencode-go --provider openai --model gpt-5.2-codex --verbose
-
-# Setup
-opencode-go --setup          Configure OpenCode Go API key
-opencode-go --oauth-login     Authenticate with OpenAI (ChatGPT Plus/Pro)
-opencode-go --reset           Delete config
-opencode-go --list           Show available models (default provider)
-opencode-go --list --provider openai     Show OpenAI models
-opencode-go --list --provider opencode   Show OpenCode Go models
-
-# Provider selection
+# Direct launch with flags
+opencode-go --model minimax-m2.7
 opencode-go --provider openai --model gpt-5.2-codex
-opencode-go --provider opencode --model minimax-m2.7
+opencode-go --model minimax-m2.7 --permission-mode acceptEdits
+opencode-go --provider openai --model gpt-5.2-codex --permission-mode auto
+opencode-go --dangerously-skip-permissions --model minimax-m2.7
+
+# Setup / Auth
+opencode-go --setup           Configure OpenCode Go API key
+opencode-go --oauth-login     Authenticate with OpenAI (ChatGPT Plus/Pro)
+opencode-go --oauth-logout    Remove OpenAI tokens
+opencode-go --reset           Delete all config
+
+# List models
+opencode-go --list                        Show default provider models
+opencode-go --list --provider openai      Show OpenAI models
+opencode-go --list --provider opencode    Show OpenCode Go models
 
 # Proxy-only mode (for testing)
 opencode-go --proxy --port 8080
@@ -266,16 +295,27 @@ opencode-go --model invalid-model
 | [.specs/codebase/STRUCTURE.md](.specs/codebase/STRUCTURE.md) | File structure and module organization |
 | [.specs/codebase/INTEGRATIONS.md](.specs/codebase/INTEGRATIONS.md) | External integrations and APIs |
 
+## WebSearch (SearXNG)
+
+The proxy intercepts `web_search` server tool requests from Claude Code and executes them locally via a SearXNG Docker container.
+
+- Container: `opencode-searxng` (port 8888)
+- Auto-started in background when proxy launches
+- Settings generated at `~/.opencode-go-cli/searxng/settings.yml`
+- Requires Docker to be available; gracefully degrades if not
+
 ## Current State
 
 - 49 tests passing (Bun test runner)
 - Build clean (`bun build` → `dist/index.js`)
-- All 5 milestones complete:
+- All 7 milestones complete:
   - ✅ Modular refactoring (12 modules, ~40-220 lines each)
   - ✅ Test suite (conversion, helpers, env, logger)
   - ✅ Debug logging gated (DEBUG=1 for verbose output)
   - ✅ UX improvements (spinner, fail-fast, clear errors)
   - ✅ Codex OAuth provider (OpenAI via OAuth, GPT-5.x family)
+  - ✅ WebSearch interception via SearXNG
+  - ✅ Interactive CLI and permission modes
 
 ## License
 

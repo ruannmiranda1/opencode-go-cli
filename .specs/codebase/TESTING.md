@@ -72,8 +72,25 @@ O streaming é crítico mas testar requer setup complexo de mock. smoke test man
 
 `getConfig()`, `saveConfig()`, `deleteConfig()` leem/escrevem em `~/.opencode-go-cli/config.json`. Tests de CLI que usassem essas funções precisariam de mock de fs.
 
+## Known Gaps
+
+### WebSearch / SearXNG
+
+**Status:** Sem testes dedicados. `hasWebSearchTool()`, `handleWebSearch()`, `ensureSearXNG()`, e `search()` não têm cobertura de teste. Requer mock de Docker commands e fetch para SearXNG.
+
+### Permission Modes
+
+**Status:** Sem testes dedicados. `selectPermissionMode()` e `buildPermissionArgs()` são funções simples mas não testadas. `buildPermissionArgs()` é pure function e testável.
+
+### Responses API Conversions
+
+**Status:** Sem testes dedicados para `convertAnthropicRequestToResponses()`, `convertResponsesApiToAnthropic()`, e `streamResponsesToAnthropic()`.
+
 ## Recommendations
 
 1. **streamOpenAIToAnthropic():** adicionar teste quando mocking de `Response.body` estiver resolvido
 2. **Config functions:** mock de `node:fs` em `tests/helpers/` se cobertura de CLI for prioridade
 3. **CLI tests:** smoke test manual é suficiente para UX validation
+4. **buildPermissionArgs():** pure function, fácil de testar — boa candidate para próxima rodada
+5. **hasWebSearchTool():** pure function, testável com fixtures JSON
+6. **Responses API conversions:** mesma abordagem dos testes de Chat Completions existentes

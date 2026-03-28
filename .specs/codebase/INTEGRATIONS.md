@@ -26,6 +26,7 @@
 **Notas:**
 - A API é OpenAI-compatível (Chat Completions) mas o proxy traduz do protocolo Anthropic
 - Streaming é SSE com `data: {"choices":[...]}` (sem evento nomeado)
+- Non-streaming também é suportado
 
 ---
 
@@ -42,6 +43,8 @@
 **Authentication:** Bearer token OAuth (obtido via PKCE flow com `auth.openai.com`, guardado em `config.openaiTokens`). Token refresh automático 1min antes da expiração.
 
 **Conversão:** Anthropic → Responses API via `convertAnthropicRequestToResponses()`
+
+**Codex stream=true:** O backend Codex sempre requer `stream: true`. Quando o Claude Code pede non-streaming, o proxy consome a stream internamente, coleta text/tool blocks, e monta uma response JSON completa antes de devolver.
 
 **Diferenças do Chat Completions:**
 
@@ -226,22 +229,63 @@ const stream = new ReadableStream({
 });
 ```
 
+## SearXNG (Docker)
+
+**Purpose:** Motor de busca local para WebSearch interception — executa queries de `web_search` server tools sem depender da API Anthropic.
+
+**Location:** `src/search/searxng.ts`
+
+**Container:** `opencode-searxng` (imagem `searxng/searxng`)
+
+**Porta:** 8888 (mapeada para 8080 dentro do container)
+
+**Settings:** `~/.opencode-go-cli/searxng/settings.yml` (gerado automaticamente com JSON format habilitado)
+
+**Fluxo:**
+1. `ensureSearXNG()` verifica se container já está rodando
+2. Se não, verifica se Docker está disponível
+3. Tenta `docker start opencode-searxng` (container parado)
+4. Se não existe, `docker run -d` com volume mount dos settings
+5. Poll `/healthz` até ficar pronto (max 15s)
+6. `search(query)` faz GET em `localhost:8888/search?format=json`
+
+**Graceful degradation:** Se Docker não está disponível, WebSearch interception é desabilitado. O proxy continua funcionando normalmente.
+
+---
+
+## WebSearch Interception
+
+**Purpose:** Intercepta requests de server tool `web_search` do Claude Code e executa localmente via SearXNG.
+
+**Location:** `src/proxy/websearch-interceptor.ts`
+
+**Detecção:** `hasWebSearchTool(body)` verifica se `body.tools` contém tools com tipo `web_search_*` ou nome `web_search` sem `input_schema`.
+
+**Resposta:** Retorna response Anthropic-format com:
+- `server_tool_use` block (web_search)
+- `web_search_tool_result` block (resultados ou erro)
+- `text` block (resumo legível dos resultados)
+
+Suporta streaming e non-streaming.
+
+---
+
 ## Logger
 
-**Purpose:** Logging configurável para o proxy.
+**Purpose:** Logging configurável para o proxy com file output.
 
 **Location:** `src/logger.ts`
 
-O logger é usado pelo proxy e streams. Todos os `console.log`/`console.error` do proxy passaram a usar o logger com `DEBUG=1` para ativação.
+O logger é usado pelo proxy, streams, WebSearch e SearXNG. Quando o proxy roda embutido (junto com Claude Code), `silenceLogger()` é chamado após `startProxy()` para não poluir o terminal interativo. No modo `--proxy` isolado, os logs aparecem normalmente.
 
-Quando o proxy roda embutido (junto com Claude Code), `silenceLogger()` é chamado antes de `startProxy()` para não poluir o terminal interativo. No modo `--proxy` isolado, os logs aparecem normalmente.
+**File output:** Quando silenciado + `DEBUG=1`, todos os logs são escritos em `~/.opencode-go-cli/proxy.log` via `appendFileSync`.
 
 ```typescript
 import { createLogger, silenceLogger } from "./logger.js";
 const logger = createLogger("[proxy]");
 
-silenceLogger();           // silencia tudo (modo embutido)
-logger.debug("...");       // só com DEBUG=1
-logger.info("...");        // silenciado em modo embutido
-logger.error("...");       // silenciado em modo embutido
+silenceLogger();           // silencia console (modo embutido)
+logger.debug("...");       // só com DEBUG=1 (vai pro arquivo se silenciado)
+logger.info("...");        // silenciado no console, vai pro arquivo com DEBUG=1
+logger.error("...");       // silenciado no console, vai pro arquivo com DEBUG=1
 ```

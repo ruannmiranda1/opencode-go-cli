@@ -6,10 +6,11 @@
 
 O código é dividido em módulos com responsabilidade clara:
 
-1. **CLI (`src/cli.ts`):** Parseia argumentos, prompts interativos, spawn do Claude Code
-2. **Proxy (`src/proxy/server.ts`):** Bun.serve que roteia entre dois formatos de API baseado no provider
+1. **CLI (`src/cli.ts`):** Menus interativos (Start/Settings), seleção de provider/model/permission mode, spawn do Claude Code
+2. **Proxy (`src/proxy/server.ts`):** Bun.serve que roteia entre dois formatos de API baseado no provider + WebSearch interception
 3. **Conversões Chat Completions (`src/proxy/request-conversion.ts`, `response-conversion.ts`, `stream-conversion.ts`):** Funções puras — Anthropic ↔ Chat Completions (OpenCode Go)
 4. **Conversões Responses API (`src/proxy/*-responses.ts`):** Funções puras — Anthropic ↔ Responses API (OpenAI/Codex)
+5. **WebSearch (`src/proxy/websearch-interceptor.ts` + `src/search/searxng.ts`):** Interceptação de server tools `web_search_*` com execução local via SearXNG Docker
 
 ## Identified Patterns
 
@@ -22,11 +23,11 @@ O código é dividido em módulos com responsabilidade clara:
 
 O proxy é stateless entre requisições — cada requisição é transformada e enviada ao upstream independentemente.
 
-### Logger com Silenciamento
+### Logger com Silenciamento e File Output
 
 **Location:** `src/logger.ts`
-**Purpose:** Logging com níveis + silenciamento em modo embutido
-**Implementation:** `silenceLogger()` é chamado antes de `startProxy()` quando o proxy roda junto com Claude Code (evita poluir o terminal interativo). No modo `--proxy` isolado, os logs aparecem normalmente.
+**Purpose:** Logging com níveis + silenciamento em modo embutido + escrita em arquivo
+**Implementation:** `silenceLogger()` é chamado após `startProxy()` quando o proxy roda junto com Claude Code (evita poluir o terminal interativo). No modo `--proxy` isolado, os logs aparecem normalmente. Quando silenciado + `DEBUG=1`, todos os logs vão para `~/.opencode-go-cli/proxy.log` via `appendFileSync`.
 
 ### Configuração Persistente
 
@@ -52,14 +53,21 @@ O proxy é stateless entre requisições — cada requisição é transformada e
 
 ```
 main()
-  ├── getConfig() — lê ~/.opencode-go-cli/config.json
-  ├── setupApiKey() / selectModel() — prompts interativos (se necessário)
-  ├── startProxy() — sobe Bun.serve na porta 8080 (default)
-  └── runClaudeCode()
-        ├── resolveClaudePath() — encontra binário claude no PATH
-        ├── buildClaudeEnv() — constrói vars (ANTHROPIC_BASE_URL=http://localhost:PORT)
-        └── spawn(claude, args, { env, stdio: "inherit" })
-              └── spinner (clack/prompts) enquanto Claude Code inicia
+  ├── parse flags (--provider, --model, --permission-mode, etc.)
+  ├── interactiveMain() — se sem flags, mostra menu Start/Settings
+  │     ├── selectProvider() → OpenCode Go / OpenAI
+  │     ├── ensureProviderAuth() → verifica/solicita auth
+  │     ├── selectModel() → lista de modelos do provider
+  │     └── selectPermissionMode() → default/acceptEdits/auto/bypassPermissions
+  ├── startFlow()
+  │     ├── startProxy() — sobe Bun.serve na porta 8080 (default)
+  │     ├── silenceLogger() — silencia logs pro terminal
+  │     ├── buildPermissionArgs() — converte mode em flags do Claude Code
+  │     └── runClaudeCode()
+  │           ├── resolveClaudePath() — encontra binário claude no PATH
+  │           ├── buildClaudeEnv() — constrói vars (ANTHROPIC_BASE_URL=http://localhost:PORT)
+  │           └── spawn(claude, [--model, ...permArgs], { env, stdio: "inherit" })
+  └── settingsMenu() — Set API key / Login OpenAI / Logout OpenAI / Reset all
 ```
 
 ### Fluxo Proxy (requisição única)
@@ -69,6 +77,7 @@ Bun.serve.fetch(req)
   ├── HEAD/GET / → 200 OK (Claude Code connectivity check)
   └── POST /v1/messages
         ├── req.json() — parsing do body Anthropic
+        ├── hasWebSearchTool() → se true, handleWebSearch() via SearXNG (return)
         ├── isResponses = provider === "openai"
         ├── Se OpenCode Go (Chat Completions):
         │     ├── convertAnthropicRequestToOpenAI()
@@ -76,8 +85,32 @@ Bun.serve.fetch(req)
         │     ├── streamOpenAIToAnthropic() ou convertOpenAIResponseToAnthropic()
         └── Se OpenAI/Codex (Responses API):
               ├── convertAnthropicRequestToResponses()
-              ├── fetch(CODEX_API_URL) → /backend-api/codex/responses
-              ├── streamResponsesToAnthropic() ou convertResponsesApiToAnthropic()
+              ├── fetch(CODEX_API_URL) → /backend-api/codex/responses (sempre stream=true)
+              ├── Se cliente quer streaming: streamResponsesToAnthropic() → passthrough
+              └── Se cliente quer non-streaming: consome stream → monta JSON response
+```
+
+### Fluxo WebSearch Interception
+
+```
+POST /v1/messages (com tool web_search_20250305)
+  ├── hasWebSearchTool() detecta server tool
+  ├── extractQuery() extrai query (padrão "for the query: ...")
+  ├── search(query) → SearXNG localhost:8888/search?format=json
+  ├── buildSearchResultBlocks() → server_tool_use + web_search_tool_result + text
+  └── handleWebSearch() retorna Response Anthropic (streaming ou non-streaming)
+```
+
+### Fluxo SearXNG (background)
+
+```
+startProxy()
+  └── ensureSearXNG() (async, background)
+        ├── isContainerRunning() → docker inspect opencode-searxng
+        ├── isDockerAvailable() → docker info
+        ├── ensureSettings() → ~/.opencode-go-cli/searxng/settings.yml
+        ├── startContainer() → docker run -d opencode-searxng (porta 8888)
+        └── waitForReady() → poll /healthz até responder (max 15s)
 ```
 
 ### Fluxo de Conversão — Chat Completions (OpenCode Go)
@@ -136,21 +169,24 @@ src/
 ├── config.ts           # getConfig, saveConfig, deleteConfig
 ├── path.ts            # resolveClaudePath
 ├── env.ts             # buildClaudeEnv, cleanupClaudeCodeVars
-├── logger.ts          # createLogger (DEBUG/INFO/WARN/ERROR) + silenceLogger()
-├── cli.ts             # main(), setupApiKey(), selectModel(), runClaudeCode(), setupOpenAIOAuth()
+├── logger.ts          # createLogger (DEBUG/INFO/WARN/ERROR) + silenceLogger() + file output
+├── cli.ts             # main(), interactiveMain(), settingsMenu(), selectPermissionMode(), runClaudeCode()
 ├── auth/
 │   ├── oauth.ts       # createAuthorizationFlow, exchangeAuthorizationCode, refreshAccessToken
 │   └── server.ts      # startLocalOAuthServer (porta 1455)
+├── search/
+│   └── searxng.ts     # ensureSearXNG(), search() — Docker container management + queries
 └── proxy/
     ├── types.ts                          # Config, Model interfaces
     ├── helpers.ts                        # mapStopReason, generateMsgId, convertImageSource, makeSSE
+    ├── websearch-interceptor.ts          # hasWebSearchTool(), handleWebSearch() — interception via SearXNG
     ├── request-conversion.ts             # Anthropic → Chat Completions (OpenCode Go)
     ├── response-conversion.ts            # Chat Completions → Anthropic (OpenCode Go)
     ├── stream-conversion.ts              # Chat Completions SSE → Anthropic SSE (OpenCode Go)
     ├── request-conversion-responses.ts   # Anthropic → Responses API (OpenAI/Codex)
     ├── response-conversion-responses.ts  # Responses API → Anthropic (OpenAI/Codex)
     ├── stream-conversion-responses.ts    # Responses API SSE → Anthropic SSE (OpenAI/Codex)
-    └── server.ts                         # startProxy() + Bun.serve + dual routing
+    └── server.ts                         # startProxy() + Bun.serve + dual routing + WebSearch
 ```
 
 **Module boundaries:**
@@ -159,10 +195,12 @@ src/
 - `config.ts` — depende de constants
 - `path.ts` — depende de constants
 - `env.ts` — depende de constants
-- `logger.ts` — sem dependências
+- `logger.ts` — sem dependências (usa node:fs, node:path, node:os)
 - `auth/oauth.ts` — depende de constants
 - `auth/server.ts` — sem dependências externas
+- `search/searxng.ts` — depende de logger
 - `cli.ts` — orchestrator (importa tudo)
 - `proxy/helpers.ts` — sem dependências
+- `proxy/websearch-interceptor.ts` — depende de helpers + search/searxng + logger
 - `proxy/*-conversion*.ts` — dependem de helpers
-- `proxy/server.ts` — imports de todos os proxy modules + logger + auth/oauth
+- `proxy/server.ts` — imports de todos os proxy modules + logger + auth/oauth + websearch-interceptor + search/searxng

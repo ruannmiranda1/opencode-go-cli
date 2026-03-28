@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current Milestone:** Milestone 5 — Codex OAuth Provider
+**Current Milestone:** Milestone 7 — Interactive CLI & Permission Modes
 **Status:** Complete
 
 ---
@@ -86,9 +86,37 @@
 
 ---
 
+## Milestone 6: WebSearch Interception via SearXNG — ✅ COMPLETE
+
+**Goal:** Interceptar requests de `web_search` server tool e executar localmente via SearXNG Docker container.
+
+**Resultado:**
+- `src/search/searxng.ts`: gerenciamento do container Docker (start, health check, search queries)
+- `src/proxy/websearch-interceptor.ts`: detecção de server tools `web_search_*`, execução via SearXNG, response Anthropic-format
+- Container `opencode-searxng` na porta 8888, auto-iniciado em background
+- Settings gerados em `~/.opencode-go-cli/searxng/settings.yml`
+- Graceful degradation: se Docker não disponível, interception desabilitado
+- Suporta streaming e non-streaming responses
+
+---
+
+## Milestone 7: Interactive CLI & Permission Modes — ✅ COMPLETE
+
+**Goal:** Menu interativo completo com seleção de provider, modelo, e modo de permissão.
+
+**Resultado:**
+- Menu Start/Settings com `@clack/prompts`
+- Settings: Set API key, Login/Logout OpenAI, Reset all
+- 4 permission modes: default, acceptEdits, auto, bypassPermissions
+- `--permission-mode` flag e `--dangerously-skip-permissions` shortcut
+- `--oauth-logout` flag para remover tokens OpenAI
+- Flags CLI pulam o menu interativo quando especificadas
+
+---
+
 ## Future Considerations
 
 - Auto-update da CLI
 - Modo daemon (proxy rodando em background)
 - Testes E2E com Claude Code real
-- Logout (`--logout` para limpar tokens OpenAI)
+- Testes para WebSearch/SearXNG/permission modes (known gap)
