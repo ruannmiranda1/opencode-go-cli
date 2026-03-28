@@ -3,18 +3,26 @@
 // ============================================================
 
 import { spawn } from "node:child_process";
+import { open } from "node:fs/promises";
 import * as p from "@clack/prompts";
-import { MODELS, DEFAULT_PROXY_PORT } from "./constants.js";
+import {
+  MODELS,
+  OPENAI_MODELS,
+  DEFAULT_PROXY_PORT,
+  PROVIDERS,
+  type Provider,
+} from "./constants.js";
 import { getConfig, saveConfig, deleteConfig } from "./config.js";
 import { resolveClaudePath } from "./path.js";
 import { buildClaudeEnv } from "./env.js";
 import { startProxy } from "./proxy/server.js";
+import { silenceLogger } from "./logger.js";
+import { createAuthorizationFlow, exchangeAuthorizationCode } from "./auth/oauth.js";
+import { startLocalOAuthServer } from "./auth/server.js";
 
-// ─── Helpers ───────────────────────────────────────────────
+// ─── Auth helpers ─────────────────────────────────────────
 
 async function setupApiKey(): Promise<string> {
-  p.intro("OpenCode Go CLI - Setup");
-
   const apiKey = await p.text({
     message: "Enter your OpenCode Go API key:",
     placeholder: "sk-opencode-...",
@@ -24,7 +32,7 @@ async function setupApiKey(): Promise<string> {
   });
 
   if (p.isCancel(apiKey)) {
-    p.cancel("Operation cancelled");
+    p.cancel("Cancelled");
     process.exit(0);
   }
 
@@ -32,16 +40,212 @@ async function setupApiKey(): Promise<string> {
   config.apiKey = apiKey as string;
   saveConfig(config);
 
-  p.log.success("API key saved successfully!");
+  p.log.success("API key saved!");
   return apiKey as string;
 }
 
-async function selectModel(): Promise<string> {
+async function setupOpenAIOAuth(): Promise<boolean> {
+  const spinner = p.spinner();
+  spinner.start("Starting authorization flow...");
+
+  const flow = await createAuthorizationFlow();
+  const server = await startLocalOAuthServer(flow.state);
+
+  spinner.stop("Authorization server ready");
+
+  try {
+    await open(flow.url);
+  } catch {
+    // ignore if browser can't be opened
+  }
+
+  if (!server.ready) {
+    server.close();
+    p.log.error("OAuth server failed to start. Port 1455 may be in use.");
+    p.log.info(`Visit this URL manually: ${flow.url}`);
+    return false;
+  }
+
+  p.log.info("Waiting for authorization...");
+  p.log.info(`Or visit: ${flow.url}`);
+
+  const result = await server.waitForCode();
+  server.close();
+
+  if (!result) {
+    p.log.error("Authorization timeout. Please try again.");
+    return false;
+  }
+
+  const tokens = await exchangeAuthorizationCode(result.code, flow.pkce.verifier);
+
+  if (tokens.type === "success") {
+    const config = getConfig();
+    config.openaiTokens = {
+      access: tokens.access,
+      refresh: tokens.refresh,
+      expiresAt: tokens.expires,
+    };
+    saveConfig(config);
+    p.log.success("OpenAI authenticated!");
+    return true;
+  }
+
+  p.log.error("Authorization failed. Please try again.");
+  return false;
+}
+
+// ─── Interactive menus ────────────────────────────────────
+
+function getProviderStatus(): { opencode: string; openai: string } {
+  const config = getConfig();
+  const opencode = config.apiKey
+    ? `✓ ${config.apiKey.slice(0, 12)}...`
+    : "not configured";
+  const openai = config.openaiTokens
+    ? "✓ logged in"
+    : "not logged in";
+  return { opencode, openai };
+}
+
+async function interactiveMain(): Promise<void> {
+  const status = getProviderStatus();
+
+  p.intro("OpenCode Go CLI");
+
+  const action = await p.select({
+    message: "What do you want to do?",
+    options: [
+      { value: "start", label: "Start Claude Code", hint: "launch with a model" },
+      { value: "settings", label: "Settings", hint: "providers, keys, login" },
+    ],
+  });
+
+  if (p.isCancel(action)) {
+    p.cancel("Bye!");
+    process.exit(0);
+  }
+
+  if (action === "settings") {
+    await settingsMenu();
+    return;
+  }
+
+  // ─── Start flow ───
+  await startFlow();
+}
+
+async function settingsMenu(): Promise<void> {
+  const status = getProviderStatus();
   const config = getConfig();
 
+  const setting = await p.select({
+    message: "Settings:",
+    options: [
+      {
+        value: "opencode-key",
+        label: `OpenCode Go — API key`,
+        hint: status.opencode,
+      },
+      {
+        value: "openai-login",
+        label: `OpenAI — Login with OAuth`,
+        hint: status.openai,
+      },
+      ...(config.openaiTokens
+        ? [{
+            value: "openai-logout" as const,
+            label: "OpenAI — Logout",
+            hint: "remove saved tokens",
+          }]
+        : []),
+      {
+        value: "reset",
+        label: "Reset all",
+        hint: "delete all configuration",
+      },
+      { value: "back", label: "← Back" },
+    ],
+  });
+
+  if (p.isCancel(setting)) {
+    p.cancel("Bye!");
+    process.exit(0);
+  }
+
+  if (setting === "opencode-key") {
+    await setupApiKey();
+    p.log.info("Run opencode-go again to start Claude Code.");
+    process.exit(0);
+  }
+
+  if (setting === "openai-login") {
+    await setupOpenAIOAuth();
+    p.log.info("Run opencode-go again to start Claude Code.");
+    process.exit(0);
+  }
+
+  if (setting === "openai-logout") {
+    const config = getConfig();
+    delete config.openaiTokens;
+    if (config.provider === "openai") config.provider = "opencode";
+    saveConfig(config);
+    p.log.success("OpenAI tokens removed.");
+    process.exit(0);
+  }
+
+  if (setting === "reset") {
+    const confirm = await p.confirm({
+      message: "Delete all configuration? This cannot be undone.",
+      initialValue: false,
+    });
+    if (p.isCancel(confirm) || !confirm) {
+      p.log.info("Cancelled.");
+      process.exit(0);
+    }
+    deleteConfig();
+    p.log.success("All configuration deleted.");
+    process.exit(0);
+  }
+
+  // back
+  await interactiveMain();
+}
+
+async function selectProvider(): Promise<Provider> {
+  const status = getProviderStatus();
+
+  const provider = await p.select({
+    message: "Select provider:",
+    options: [
+      {
+        value: "opencode" as Provider,
+        label: "OpenCode Go",
+        hint: status.opencode,
+      },
+      {
+        value: "openai" as Provider,
+        label: "OpenAI (ChatGPT Plus/Pro)",
+        hint: status.openai,
+      },
+    ],
+  });
+
+  if (p.isCancel(provider)) {
+    p.cancel("Bye!");
+    process.exit(0);
+  }
+
+  return provider as Provider;
+}
+
+async function selectModel(provider: Provider): Promise<string> {
+  const config = getConfig();
+  const models = provider === "openai" ? OPENAI_MODELS : MODELS;
+
   const model = await p.select({
-    message: "Select a model:",
-    options: MODELS.map((m) => ({
+    message: "Select model:",
+    options: models.map((m) => ({
       value: m.id,
       label: m.name,
       hint: m.description,
@@ -50,86 +254,231 @@ async function selectModel(): Promise<string> {
   });
 
   if (p.isCancel(model)) {
-    p.cancel("Operation cancelled");
+    p.cancel("Bye!");
     process.exit(0);
   }
 
   return model as string;
 }
 
-function printHelp(): void {
-  console.log(`
-OpenCode Go CLI - Manage OpenCode Go subscription and launch Claude Code
+type PermissionMode = "default" | "acceptEdits" | "auto" | "bypassPermissions";
 
-Usage: opencode-go [options] [claude-code-flags...]
+async function selectPermissionMode(): Promise<PermissionMode> {
+  const mode = await p.select({
+    message: "Permission mode:",
+    options: [
+      {
+        value: "default" as PermissionMode,
+        label: "Default",
+        hint: "asks permission for everything",
+      },
+      {
+        value: "acceptEdits" as PermissionMode,
+        label: "Accept edits",
+        hint: "auto-approve file edits, ask for commands",
+      },
+      {
+        value: "auto" as PermissionMode,
+        label: "Auto mode",
+        hint: "classifier reviews actions (experimental)",
+      },
+      {
+        value: "bypassPermissions" as PermissionMode,
+        label: "Bypass permissions",
+        hint: "skip all checks — use with caution",
+      },
+    ],
+  });
 
-Options:
-  --setup         Configure your OpenCode Go API key
-  --reset         Reset configuration (delete API key)
-  --list          List available models
-  --model <id>    Run with specific model (non-interactive)
-  --proxy         Start proxy server only (for testing)
-  --port <port>   Set proxy port (default: ${DEFAULT_PROXY_PORT})
-  --version, -v   Show version
-  --help, -h      Show this help message
+  if (p.isCancel(mode)) {
+    p.cancel("Bye!");
+    process.exit(0);
+  }
 
-Examples:
-  opencode-go --setup
-  opencode-go --list
-  opencode-go --model minimax-m2.7
-  opencode-go --model minimax-m2.7 -p "explain this code"
-    `);
+  return mode as PermissionMode;
 }
+
+function buildPermissionArgs(mode: PermissionMode): string[] {
+  switch (mode) {
+    case "default":
+      return [];
+    case "acceptEdits":
+      return ["--permission-mode", "acceptEdits"];
+    case "auto":
+      return ["--permission-mode", "auto", "--enable-auto-mode"];
+    case "bypassPermissions":
+      return ["--dangerously-skip-permissions"];
+  }
+}
+
+async function ensureProviderAuth(provider: Provider): Promise<boolean> {
+  const config = getConfig();
+
+  if (provider === "openai") {
+    if (config.openaiTokens) return true;
+    p.log.warn("Not logged in to OpenAI.");
+    const shouldAuth = await p.confirm({
+      message: "Login with OpenAI now?",
+      initialValue: true,
+    });
+    if (p.isCancel(shouldAuth) || !shouldAuth) return false;
+    return await setupOpenAIOAuth();
+  }
+
+  if (config.apiKey) return true;
+  p.log.warn("No OpenCode Go API key configured.");
+  const shouldSetup = await p.confirm({
+    message: "Set up API key now?",
+    initialValue: true,
+  });
+  if (p.isCancel(shouldSetup) || !shouldSetup) return false;
+  await setupApiKey();
+  return true;
+}
+
+async function startFlow(
+  providerOverride?: Provider,
+  modelOverride?: string,
+  permissionOverride?: PermissionMode,
+  portOverride?: number,
+): Promise<void> {
+  // 1. Provider
+  const provider = providerOverride ?? await selectProvider();
+
+  // 2. Auth check
+  if (!(await ensureProviderAuth(provider))) {
+    p.cancel("Authentication required.");
+    process.exit(1);
+  }
+
+  // 3. Model
+  const model = modelOverride ?? await selectModel(provider);
+
+  // 4. Permission mode (only interactive if not overridden)
+  const permMode = permissionOverride ?? await selectPermissionMode();
+
+  // 5. Save config
+  const config = getConfig();
+  config.provider = provider;
+  config.lastModel = model;
+  const port = portOverride ?? config.proxyPort ?? DEFAULT_PROXY_PORT;
+  config.proxyPort = port;
+  saveConfig(config);
+
+  // 6. Resolve auth token
+  const freshConfig = getConfig();
+  const authToken = provider === "openai"
+    ? freshConfig.openaiTokens!.access
+    : freshConfig.apiKey!;
+
+  // 7. Start proxy + Claude Code
+  const proxyUrl = `http://localhost:${port}`;
+  await startProxy(port, provider);
+  silenceLogger();
+
+  const permArgs = buildPermissionArgs(permMode);
+  await runClaudeCode(model, proxyUrl, authToken, permArgs);
+  process.exit(0);
+}
+
+// ─── Claude Code launcher ─────────────────────────────────
 
 async function runClaudeCode(
   model: string,
   baseUrl: string,
+  authToken: string,
   extraArgs: string[],
 ): Promise<number> {
   const config = getConfig();
+  const provider = config.provider || "opencode";
 
-  if (!config.apiKey) {
-    p.log.error("No API key configured. Run with --setup first.");
-    return 1;
+  if (provider === "openai") {
+    p.log.success(`Provider: OpenAI`);
+    p.log.success(`Model: ${model}`);
+  } else {
+    p.log.success(`Provider: OpenCode Go`);
+    p.log.success(`Model: ${model}`);
+  }
+
+  if (extraArgs.length > 0) {
+    p.log.info(`Flags: ${extraArgs.join(" ")}`);
   }
 
   const claudePath = resolveClaudePath();
-  const env = buildClaudeEnv(config.apiKey, model, baseUrl);
-  const args: string[] = ["--model", model, ...extraArgs];
-
-  p.log.success(`Endpoint: ${baseUrl}`);
-  p.log.success(`API Key: ${config.apiKey.slice(0, 10)}...`);
-  p.log.success(`Model: ${model}`);
+  const env = buildClaudeEnv(authToken, model, baseUrl);
+  const spawnArgs = ["--model", model, ...extraArgs];
 
   const spinner = p.spinner();
   spinner.start(`Starting Claude Code with ${model}...`);
+  spinner.stop(`Launching Claude Code with ${model}`);
 
   return new Promise<number>((resolve) => {
-    const child = spawn(claudePath, args, {
+    const child = spawn(claudePath, spawnArgs, {
       stdio: "inherit",
       env,
     });
 
     child.on("error", (err) => {
-      spinner.stop(`Failed to start Claude Code: ${err.message}`);
+      p.log.error(`Failed to start Claude Code: ${err.message}`);
       resolve(1);
     });
 
     child.on("close", (code) => {
-      if (code === 0) {
-        spinner.stop("Claude Code exited");
-      } else {
-        spinner.stop(`Claude Code exited with code ${code}`);
-      }
       resolve(code ?? 0);
     });
   });
 }
 
-// ─── Main ──────────────────────────────────────────────────
+// ─── Help ─────────────────────────────────────────────────
+
+function printHelp(): void {
+  console.log(`
+OpenCode Go CLI — Use OpenCode Go or OpenAI models with Claude Code
+
+Usage: opencode-go [options]
+
+Interactive (no args):
+  opencode-go               Select provider, model, and permission mode
+
+Options:
+  --provider <name>         Provider: opencode (default) or openai
+  --model <id>              Model ID (skip model selection)
+  --permission-mode <mode>  default | acceptEdits | auto | bypassPermissions
+  --setup                   Configure OpenCode Go API key
+  --oauth-login             Authenticate with OpenAI (ChatGPT Plus/Pro)
+  --oauth-logout            Remove OpenAI tokens
+  --reset                   Delete all configuration
+  --list                    List available models
+  --proxy                   Start proxy server only (for testing)
+  --port <port>             Proxy port (default: ${DEFAULT_PROXY_PORT})
+  --version, -v             Show version
+  --help, -h                Show this help
+
+Providers:
+  opencode    OpenCode Go models (MiniMax, Kimi, GLM)
+  openai      OpenAI models via OAuth (GPT-5.x family)
+
+Permission modes:
+  default             Ask permission for everything
+  acceptEdits         Auto-approve file edits, ask for commands
+  auto                Classifier reviews actions (experimental)
+  bypassPermissions   Skip all permission checks
+
+Examples:
+  opencode-go
+  opencode-go --provider openai --model gpt-5.4
+  opencode-go --model minimax-m2.7 --permission-mode acceptEdits
+  opencode-go --provider openai --model gpt-5.2-codex --permission-mode auto
+  opencode-go --list --provider openai
+  `);
+}
+
+// ─── Main ─────────────────────────────────────────────────
 
 export async function main(): Promise<void> {
   const args = process.argv.slice(2);
+
+  // ─── Direct flags (exit immediately) ───
 
   if (args.includes("--help") || args.includes("-h")) {
     printHelp();
@@ -142,7 +491,23 @@ export async function main(): Promise<void> {
   }
 
   if (args.includes("--setup")) {
+    p.intro("OpenCode Go CLI");
     await setupApiKey();
+    process.exit(0);
+  }
+
+  if (args.includes("--oauth-login")) {
+    p.intro("OpenCode Go CLI");
+    await setupOpenAIOAuth();
+    process.exit(0);
+  }
+
+  if (args.includes("--oauth-logout")) {
+    const config = getConfig();
+    delete config.openaiTokens;
+    if (config.provider === "openai") config.provider = "opencode";
+    saveConfig(config);
+    p.log.success("OpenAI tokens removed.");
     process.exit(0);
   }
 
@@ -153,75 +518,99 @@ export async function main(): Promise<void> {
   }
 
   if (args.includes("--list")) {
-    console.log("\nAvailable models in OpenCode Go:\n");
-    for (const model of MODELS) {
-      console.log(`  ${model.id.padEnd(15)} - ${model.name}`);
-      console.log(`                      ${model.description}\n`);
+    const providerIndex = args.indexOf("--provider");
+    const providerName = providerIndex !== -1 ? args[providerIndex + 1] : "opencode";
+    const models = providerName === "openai" ? OPENAI_MODELS : MODELS;
+    const label = providerName === "openai" ? "OpenAI (GPT-5.x)" : "OpenCode Go";
+    console.log(`\nAvailable models (${label}):\n`);
+    for (const model of models) {
+      console.log(`  ${model.id.padEnd(18)} ${model.name}`);
+      console.log(`  ${"".padEnd(18)} ${model.description}\n`);
     }
     process.exit(0);
   }
 
+  // ─── Proxy-only mode ───
+
   const config = getConfig();
 
-  const portIndex = args.indexOf("--port");
-  const port =
-    portIndex !== -1 && args[portIndex + 1]
-      ? parseInt(args[portIndex + 1])
-      : (config.proxyPort || DEFAULT_PROXY_PORT);
-
-  // Proxy-only mode: fail fast, no interactive prompts
   if (args.includes("--proxy")) {
-    if (!config.apiKey) {
+    const providerIndex = args.indexOf("--provider");
+    const provider: Provider = (providerIndex !== -1 && args[providerIndex + 1] as Provider) || "opencode";
+    const portIndex = args.indexOf("--port");
+    const port = portIndex !== -1 ? parseInt(args[portIndex + 1]) : (config.proxyPort || DEFAULT_PROXY_PORT);
+
+    if (provider === "openai" && !config.openaiTokens) {
+      console.error("[cli] Not authenticated with OpenAI. Run 'opencode-go --oauth-login' first.");
+      process.exit(1);
+    }
+    if (provider !== "openai" && !config.apiKey) {
       console.error("[cli] No API key configured. Run 'opencode-go --setup' first.");
       process.exit(1);
     }
-    await startProxy(port, config.apiKey);
-    await new Promise(() => {}) as Promise<never>; // keep alive
+    await startProxy(port, provider);
+    await new Promise(() => {}) as Promise<never>;
     return;
   }
 
-  // Extract model: fail fast if invalid, interactive select if missing
-  let model: string;
-  const modelArgIndex = args.findIndex((a) => a === "--model" || a === "-m");
+  // ─── Parse optional CLI overrides ───
 
-  if (modelArgIndex !== -1 && args[modelArgIndex + 1]) {
-    model = args[modelArgIndex + 1];
-    args.splice(modelArgIndex, 2);
-    // Fail fast: validate model before any setup prompt
-    const validModel = MODELS.find((m) => m.id === model);
-    if (!validModel) {
-      p.log.error(`Unknown model: ${model}`);
-      p.log.info("Run 'opencode-go --list' to see available models.");
-      process.exit(1);
-    }
-  } else {
-    // No model provided: guide through setup if needed, then interactive select
-    if (!config.apiKey) {
-      p.intro("OpenCode Go CLI");
-      p.log.warn("No API key configured. Run 'opencode-go --setup' first.");
+  const providerIndex = args.indexOf("--provider");
+  const providerOverride: Provider | undefined =
+    providerIndex !== -1 && args[providerIndex + 1]
+      ? args[providerIndex + 1] as Provider
+      : undefined;
 
-      const shouldSetup = await p.confirm({
-        message: "Would you like to set up your API key now?",
-        initialValue: true,
-      });
-
-      if (p.isCancel(shouldSetup) || !shouldSetup) {
-        p.cancel("Please run 'opencode-go --setup' to configure your API key.");
-        process.exit(1);
-      }
-
-      await setupApiKey();
-    }
-    model = await selectModel();
+  if (providerOverride && !PROVIDERS.includes(providerOverride)) {
+    p.log.error(`Unknown provider: ${providerOverride}. Options: ${PROVIDERS.join(", ")}`);
+    process.exit(1);
   }
 
-  config.lastModel = model;
-  config.proxyPort = port;
-  saveConfig(config);
+  const modelArgIndex = args.indexOf("--model");
+  const modelOverride: string | undefined =
+    modelArgIndex !== -1 && args[modelArgIndex + 1]
+      ? args[modelArgIndex + 1]
+      : undefined;
 
-  const extraArgs = args.filter((a) => !a.startsWith("--"));
+  const permIndex = args.indexOf("--permission-mode");
+  const permOverride: PermissionMode | undefined =
+    permIndex !== -1 && args[permIndex + 1]
+      ? args[permIndex + 1] as PermissionMode
+      : args.includes("--dangerously-skip-permissions")
+        ? "bypassPermissions"
+        : undefined;
 
-  const proxyUrl = `http://localhost:${port}`;
-  await runClaudeCode(model, proxyUrl, extraArgs);
-  process.exit(0);
+  const portIndex = args.indexOf("--port");
+  const portOverride: number | undefined =
+    portIndex !== -1 && args[portIndex + 1]
+      ? parseInt(args[portIndex + 1])
+      : undefined;
+
+  // ─── If any overrides, skip interactive menu ───
+
+  const hasOverrides = providerOverride || modelOverride || permOverride;
+
+  if (hasOverrides) {
+    // Validate model if both provider and model specified
+    if (modelOverride && providerOverride) {
+      const modelList = providerOverride === "openai" ? OPENAI_MODELS : MODELS;
+      if (!modelList.find((m) => m.id === modelOverride)) {
+        p.log.error(`Unknown model: ${modelOverride}`);
+        p.log.info(`Run 'opencode-go --list --provider ${providerOverride}' to see available models.`);
+        process.exit(1);
+      }
+    }
+
+    p.intro("OpenCode Go CLI");
+    await startFlow(
+      providerOverride ?? "opencode",
+      modelOverride,
+      permOverride,
+      portOverride,
+    );
+    return;
+  }
+
+  // ─── Fully interactive ───
+  await interactiveMain();
 }

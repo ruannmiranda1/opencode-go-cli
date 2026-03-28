@@ -1,6 +1,6 @@
 # Roadmap
 
-**Current Milestone:** Milestone 4 — UX Improvements
+**Current Milestone:** Milestone 5 — Codex OAuth Provider
 **Status:** Complete
 
 ---
@@ -68,9 +68,27 @@
 
 ---
 
+## Milestone 5: Codex OAuth Provider — ✅ COMPLETE
+
+**Goal:** Adicionar OpenAI como provedor via OAuth (ChatGPT Plus/Pro).
+
+**Resultado:**
+- Provider routing: `--provider opencode` (default) ou `--provider openai`
+- OAuth PKCE flow via @openauthjs/openauth (mesmo client_id do Codex CLI)
+- Servidor local em 1455 para callback OAuth
+- Token refresh automático (1min buffer)
+- 6 modelos GPT-5: gpt-5.2, 5.3, 5.4, 5.1-codex, 5.2-codex, 5.3-codex
+- Backward compatible: sem --provider, usa opencode como hoje
+- **Responses API**: OpenAI/Codex usa formato diferente do Chat Completions — 3 novos módulos de conversão (`*-responses.ts`) adicionados ao proxy, roteados automaticamente pelo provider
+- **Endpoint correto**: `chatgpt.com/backend-api/codex/responses` (não `backend.chatgpt.com`)
+- **Logger silenciado**: proxy logs não poluem terminal quando roda embutido com Claude Code
+- **Proxy auto-start**: proxy inicia automaticamente antes do Claude Code no fluxo normal
+
+---
+
 ## Future Considerations
 
 - Auto-update da CLI
 - Modo daemon (proxy rodando em background)
 - Testes E2E com Claude Code real
-- Plugin system para providers alternativos
+- Logout (`--logout` para limpar tokens OpenAI)

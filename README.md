@@ -2,9 +2,9 @@
 
 # OpenCode Go CLI
 
-**Use OpenCode Go models with Claude Code.**
+**Use OpenCode Go or OpenAI models with Claude Code.**
 
-Translates Claude Code's Anthropic requests into OpenAI API calls — in real time, chunk by chunk.
+Translates Claude Code's Anthropic requests into OpenAI API calls — in real time, chunk by chunk. Supports both OpenCode Go (API key) and OpenAI via OAuth (ChatGPT Plus/Pro).
 
 [![Bun](https://img.shields.io/badge/Runtime-Bun-1E2028?logo=bun&logoColor=f9f1e3)](https://bun.sh/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-3178C6?logo=typescript&logoColor=white)](https://www.typescriptlang.org/)
@@ -31,11 +31,12 @@ The goal is to make it work with OpenCode Go — transparently.
 - **Streaming translation** — SSE chunk-by-chunk, in real time
 - **Tool call support** — `tool_use` and `tool_result` blocks are mapped correctly
 - **Image support** — `image` content blocks converted to `data:` URIs
-- **Model selection** — interactive or `--model` flag, 4 models available
-- **Persistent config** — API key and last model stored in `~/.opencode-go-cli/`
+- **Two providers** — OpenCode Go (API key) or OpenAI via OAuth (ChatGPT Plus/Pro)
+- **Model selection** — interactive or `--model` flag, 10 models available
+- **Persistent config** — API key / OAuth tokens and last model stored in `~/.opencode-go-cli/`
 - **Sub-agent compatibility** — all sub-agents use the same model via environment variables
 - **Fail-fast validation** — invalid models caught before proxy starts
-- **Configurable logging** — `DEBUG=1` for verbose proxy output
+- **Automatic token refresh** — OAuth tokens renewed automatically
 
 ## Runtime Model
 
@@ -49,22 +50,31 @@ Stage 1: CLI (opencode-go)
 
 Stage 2: Proxy (localhost:PORT)
   └─ Receives POST /v1/messages (Anthropic format)
-  └─ Translates to OpenAI /v1/chat/completions
-  └─ Calls OpenCode Go API
+  └─ Routes based on provider:
+       ├─ OpenCode Go: Chat Completions API (/v1/chat/completions)
+       └─ OpenAI:      Responses API (/backend-api/codex/responses)
   └─ Translates response back (streaming or non-streaming)
   └─ Returns to Claude Code
 ```
 
 ### Request Flow
 
+**OpenCode Go (Chat Completions):**
 ```
-Claude Code
-  └─ POST /v1/messages (Anthropic)
-        └─ Proxy: convertAnthropicRequestToOpenAI()
-              └─ OpenCode Go API: POST /v1/chat/completions (OpenAI)
-                    └─ Response: streaming or non-streaming
-                          └─ Proxy: streamOpenAIToAnthropic() or convertOpenAIResponseToAnthropic()
-                                └─ Claude Code
+Claude Code → POST /v1/messages (Anthropic)
+  → convertAnthropicRequestToOpenAI()
+    → OpenCode Go API: POST /v1/chat/completions
+      → streamOpenAIToAnthropic() or convertOpenAIResponseToAnthropic()
+        → Claude Code
+```
+
+**OpenAI/Codex (Responses API):**
+```
+Claude Code → POST /v1/messages (Anthropic)
+  → convertAnthropicRequestToResponses()
+    → Codex backend: POST /backend-api/codex/responses
+      → streamResponsesToAnthropic() or convertResponsesApiToAnthropic()
+        → Claude Code
 ```
 
 ### Environment Variables Injected
@@ -84,18 +94,24 @@ Claude Code
 src/
 ├── index.ts                 Thin entry point (shebang + main export)
 ├── cli.ts                  Argument parsing, interactive prompts, Claude Code spawn
-├── constants.ts            MODELS, ENDPOINT, CONFIG_DIR, DEFAULT_PROXY_PORT
+├── constants.ts            MODELS, OPENAI_MODELS, PROVIDERS, OAuth constants
 ├── config.ts               getConfig, saveConfig, deleteConfig
 ├── path.ts                 resolveClaudePath (claude binary in PATH)
 ├── env.ts                  buildClaudeEnv, cleanupClaudeCodeVars
-├── logger.ts               createLogger (DEBUG/INFO/WARN/ERROR, gated by DEBUG env)
+├── logger.ts               createLogger (DEBUG/INFO/WARN/ERROR) + silenceLogger()
+├── auth/
+│   ├── oauth.ts           PKCE, exchange, refresh, JWT decode
+│   └── server.ts          Local HTTP server for OAuth callback
 └── proxy/
-    ├── types.ts             Config, Model interfaces
-    ├── helpers.ts           mapStopReason, generateMsgId, convertImageSource, formatDelta
-    ├── request-conversion.ts   Anthropic → OpenAI request
-    ├── response-conversion.ts   OpenAI → Anthropic response (non-streaming)
-    ├── stream-conversion.ts     OpenAI SSE → Anthropic SSE (async generator)
-    └── server.ts               Bun.serve + routing
+    ├── types.ts                          Config, Model interfaces
+    ├── helpers.ts                        mapStopReason, generateMsgId, convertImageSource
+    ├── request-conversion.ts             Anthropic → Chat Completions (OpenCode Go)
+    ├── response-conversion.ts            Chat Completions → Anthropic (OpenCode Go)
+    ├── stream-conversion.ts              Chat Completions SSE → Anthropic SSE (OpenCode Go)
+    ├── request-conversion-responses.ts   Anthropic → Responses API (OpenAI/Codex)
+    ├── response-conversion-responses.ts  Responses API → Anthropic (OpenAI/Codex)
+    ├── stream-conversion-responses.ts    Responses API SSE → Anthropic SSE (OpenAI/Codex)
+    └── server.ts                         Bun.serve + dual routing
 
 tests/
 ├── helpers.test.ts
@@ -107,6 +123,8 @@ tests/
 
 ## Models Available
 
+### OpenCode Go (API key — `--provider opencode`)
+
 | ID | Name | Description |
 |----|------|-------------|
 | `minimax-m2.7` | MiniMax M2.7 | High performance coding model |
@@ -114,23 +132,45 @@ tests/
 | `kimi-k2.5` | Kimi K2.5 | Strong reasoning for complex tasks |
 | `glm-5` | GLM-5 | Latest generation from Zhipu AI |
 
+### OpenAI (OAuth — `--provider openai`)
+
+| ID | Name | Description |
+|----|------|-------------|
+| `gpt-5.2` | GPT-5.2 | Latest GPT-5 model |
+| `gpt-5.3` | GPT-5.3 | High performance GPT-5 |
+| `gpt-5.4` | GPT-5.4 | Balanced GPT-5 |
+| `gpt-5.1-codex` | GPT-5.1 Codex | Code-optimized GPT-5.1 |
+| `gpt-5.2-codex` | GPT-5.2 Codex | Code-optimized GPT-5.2 |
+| `gpt-5.3-codex` | GPT-5.3 Codex | Code-optimized GPT-5.3 |
+
 ## CLI
 
 ```bash
+# OpenCode Go (default — API key)
+opencode-go --model minimax-m2.7
+
+# OpenAI via OAuth (ChatGPT Plus/Pro)
+opencode-go --oauth-login
+opencode-go --provider openai --model gpt-5.2-codex
+
 # Interactive mode (select model)
 opencode-go
 
-# Non-interactive (specify model)
-opencode-go --model minimax-m2.7
-
 # With Claude Code flags
 opencode-go --model minimax-m2.7 -p "explain this code"
-opencode-go --model minimax-m2.7 --verbose
+opencode-go --provider openai --model gpt-5.2-codex --verbose
 
 # Setup
-opencode-go --setup          Configure API key
-opencode-go --reset          Delete config
-opencode-go --list           Show available models
+opencode-go --setup          Configure OpenCode Go API key
+opencode-go --oauth-login     Authenticate with OpenAI (ChatGPT Plus/Pro)
+opencode-go --reset           Delete config
+opencode-go --list           Show available models (default provider)
+opencode-go --list --provider openai     Show OpenAI models
+opencode-go --list --provider opencode   Show OpenCode Go models
+
+# Provider selection
+opencode-go --provider openai --model gpt-5.2-codex
+opencode-go --provider opencode --model minimax-m2.7
 
 # Proxy-only mode (for testing)
 opencode-go --proxy --port 8080
@@ -145,7 +185,8 @@ opencode-go --help
 
 - [Bun](https://bun.sh) runtime
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and in PATH
-- OpenCode Go subscription with API key
+- **OpenCode Go:** API key from your OpenCode Go subscription
+- **OpenAI:** ChatGPT Plus/Pro subscription (for OAuth)
 
 **Install global command:**
 
@@ -155,19 +196,19 @@ bun run build && bun install -g .
 
 Isso cria o comando `opencode-go` disponível em qualquer terminal (sem precisar de `bun run`).
 
-**Quick Start:**
+**Quick Start — OpenCode Go:**
 
-1. Configure your API key:
-   ```bash
-   opencode-go --setup
-   ```
+```bash
+opencode-go --setup
+opencode-go
+```
 
-2. Run:
-   ```bash
-   opencode-go
-   ```
+**Quick Start — OpenAI:**
 
-3. Select a model — Claude Code starts with the proxy already running.
+```bash
+opencode-go --oauth-login
+opencode-go --provider openai --model gpt-5.2-codex
+```
 
 ## Configuration
 
@@ -175,7 +216,13 @@ Config is stored at `~/.opencode-go-cli/config.json`:
 
 ```json
 {
+  "provider": "opencode",
   "apiKey": "sk-opencode-...",
+  "openaiTokens": {
+    "access": "...",
+    "refresh": "...",
+    "expiresAt": 1234567890
+  },
   "lastModel": "minimax-m2.7",
   "proxyPort": 8080
 }
@@ -223,11 +270,12 @@ opencode-go --model invalid-model
 
 - 49 tests passing (Bun test runner)
 - Build clean (`bun build` → `dist/index.js`)
-- All 4 milestones complete:
+- All 5 milestones complete:
   - ✅ Modular refactoring (12 modules, ~40-220 lines each)
   - ✅ Test suite (conversion, helpers, env, logger)
   - ✅ Debug logging gated (DEBUG=1 for verbose output)
   - ✅ UX improvements (spinner, fail-fast, clear errors)
+  - ✅ Codex OAuth provider (OpenAI via OAuth, GPT-5.x family)
 
 ## License
 

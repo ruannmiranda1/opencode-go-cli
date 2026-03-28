@@ -4,26 +4,15 @@
 
 **Purpose:** Provedor de modelos de IA — API OpenAI-compatível para chat completions.
 
-**Location:** `src/proxy/server.ts`
+**Location:** `src/proxy/server.ts`, `src/proxy/request-conversion.ts`
 
-```typescript
-const OPENCODE_GO_ENDPOINT = "https://opencode.ai/zen/go/v1/chat/completions";
+**Endpoint:** `https://opencode.ai/zen/go/v1/chat/completions`
 
-const response = await fetch(OPENCODE_GO_ENDPOINT, {
-  method: "POST",
-  headers: {
-    "Authorization": `Bearer ${apiKey}`,
-    "Content-Type": "application/json",
-  },
-  body: JSON.stringify(openaiBody),
-});
-```
+**Formato:** Chat Completions API (formato tradicional OpenAI)
 
 **Authentication:** Bearer token (API key do OpenCode Go, guardada em `~/.opencode-go-cli/config.json`).
 
-**Endpoints usados:**
-
-- `POST /v1/chat/completions` — único endpoint usado (chat completions, streaming e não-streaming)
+**Conversão:** Anthropic → Chat Completions via `convertAnthropicRequestToOpenAI()`
 
 **Modelos disponíveis (hardcoded em `src/constants.ts`):**
 
@@ -35,8 +24,71 @@ const response = await fetch(OPENCODE_GO_ENDPOINT, {
 | `glm-5` | GLM-5 |
 
 **Notas:**
-- A API é OpenAI-compatível mas o proxy traduz do protocolo Anthropic (que o Claude Code usa) pro formato OpenAI
-- Streaming é SSE (Server-Sent Events) em ambos os lados, mas com estruturas diferentes
+- A API é OpenAI-compatível (Chat Completions) mas o proxy traduz do protocolo Anthropic
+- Streaming é SSE com `data: {"choices":[...]}` (sem evento nomeado)
+
+---
+
+## OpenAI / Codex Backend (Responses API)
+
+**Purpose:** Provedor de modelos OpenAI (GPT-5.x) via OAuth — usa a Responses API, formato diferente do Chat Completions.
+
+**Location:** `src/proxy/server.ts`, `src/proxy/request-conversion-responses.ts`
+
+**Endpoint:** `https://chatgpt.com/backend-api/codex/responses`
+
+**Formato:** Responses API (formato novo da OpenAI — `instructions`, `input[]` tipado, eventos SSE nomeados)
+
+**Authentication:** Bearer token OAuth (obtido via PKCE flow com `auth.openai.com`, guardado em `config.openaiTokens`). Token refresh automático 1min antes da expiração.
+
+**Conversão:** Anthropic → Responses API via `convertAnthropicRequestToResponses()`
+
+**Diferenças do Chat Completions:**
+
+| Aspecto | Chat Completions | Responses API |
+|---------|-----------------|---------------|
+| System prompt | `messages[0].role = "system"` | `instructions` (top-level) |
+| Mensagens | `messages[]` com role/content | `input[]` com items tipados |
+| Tools | `{type: "function", function: {...}}` | `{type: "function", name, parameters}` (flat) |
+| Tool results | `{role: "tool", tool_call_id}` | `{type: "function_call_output", call_id}` |
+| SSE streaming | `data:` sem evento nomeado | `event: response.xxx` + `data:` |
+| End signal | `data: [DONE]` | `event: response.completed` |
+
+**Modelos disponíveis (hardcoded em `src/constants.ts`):**
+
+| ID | Nome |
+|----|------|
+| `gpt-5.2` | GPT-5.2 |
+| `gpt-5.3` | GPT-5.3 |
+| `gpt-5.4` | GPT-5.4 |
+| `gpt-5.1-codex` | GPT-5.1 Codex |
+| `gpt-5.2-codex` | GPT-5.2 Codex |
+| `gpt-5.3-codex` | GPT-5.3 Codex |
+
+---
+
+## OpenAI OAuth (auth.openai.com)
+
+**Purpose:** Autenticação OAuth2 PKCE para obter tokens de acesso ao Codex backend.
+
+**Location:** `src/auth/oauth.ts`, `src/auth/server.ts`
+
+**Endpoints:**
+- `GET https://auth.openai.com/oauth/authorize` — Iniciar fluxo OAuth
+- `POST https://auth.openai.com/oauth/token` — Trocar code por tokens / refresh
+
+**Client ID:** `app_EMoamEEZ73f0CkXaXp7hrann` (mesmo do Codex CLI oficial)
+
+**Callback:** `http://localhost:1455/auth/callback`
+
+**Fluxo:**
+1. Gera PKCE (challenge + verifier)
+2. Sobe servidor local na porta 1455
+3. Abre navegador com URL de autorização
+4. Usuário loga no ChatGPT
+5. Callback recebe code + state
+6. Troca code por tokens (access, refresh, expiresAt)
+7. Salva tokens em `config.json`
 
 ## Claude Code
 
@@ -123,6 +175,12 @@ spinner.stop("Done!");
 ```json
 {
   "apiKey": "sk-opencode-...",
+  "provider": "opencode",
+  "openaiTokens": {
+    "access": "...",
+    "refresh": "...",
+    "expiresAt": 1234567890
+  },
   "lastModel": "minimax-m2.7",
   "proxyPort": 8080
 }
@@ -138,20 +196,22 @@ spinner.stop("Done!");
 
 **Purpose:** Streaming do response do OpenAI no proxy.
 
-**Location:** `src/proxy/stream-conversion.ts` (`streamOpenAIToAnthropic()`), `src/proxy/server.ts`
+**Location:** `src/proxy/stream-conversion.ts`, `src/proxy/stream-conversion-responses.ts`, `src/proxy/server.ts`
 
-**Uso (async generator):**
+**Dois async generators (um por formato de API):**
 
 ```typescript
-for await (const chunk of streamOpenAIToAnthropic(response)) {
-  controller.enqueue(new TextEncoder().encode(chunk));
-}
+// Chat Completions (OpenCode Go)
+for await (const chunk of streamOpenAIToAnthropic(response)) { ... }
+
+// Responses API (OpenAI/Codex)
+for await (const chunk of streamResponsesToAnthropic(response)) { ... }
 ```
 
-O `response` vem de `fetch()` (Bun fetch API), e `streamOpenAIToAnthropic` é um async generator que:
-1. Lê chunks SSE do OpenAI via `response.body.getReader()`
-2. Converte chunk por chunk pro formato Anthropic SSE
-3. Mantém estado de blocos (`textBlockStarted`, `toolCallAccumulators`, `openaiToolIndexToBlockIndex`)
+Ambos lêem chunks SSE via `response.body.getReader()` e convertem pro formato Anthropic SSE.
+
+- `streamOpenAIToAnthropic`: estado com `toolCallAccumulators`, `openaiToolIndexToBlockIndex`
+- `streamResponsesToAnthropic`: estado com `toolCallBlocks` (item_id → blockIndex), eventos nomeados
 
 **ReadableStream usado para responder ao Claude Code:**
 
@@ -172,13 +232,16 @@ const stream = new ReadableStream({
 
 **Location:** `src/logger.ts`
 
-O logger é usado por `src/proxy/server.ts` e `src/proxy/stream-conversion.ts`. Todos os `console.log`/`console.error` do proxy passaram a usar o logger com `DEBUG=1` para ativação.
+O logger é usado pelo proxy e streams. Todos os `console.log`/`console.error` do proxy passaram a usar o logger com `DEBUG=1` para ativação.
+
+Quando o proxy roda embutido (junto com Claude Code), `silenceLogger()` é chamado antes de `startProxy()` para não poluir o terminal interativo. No modo `--proxy` isolado, os logs aparecem normalmente.
 
 ```typescript
-import { createLogger } from "./logger.js";
+import { createLogger, silenceLogger } from "./logger.js";
 const logger = createLogger("[proxy]");
 
-logger.debug("SSE chunk #1: ..."); // só com DEBUG=1
-logger.info("← status 200");
-logger.error(`API error: ${body}`);
+silenceLogger();           // silencia tudo (modo embutido)
+logger.debug("...");       // só com DEBUG=1
+logger.info("...");        // silenciado em modo embutido
+logger.error("...");       // silenciado em modo embutido
 ```

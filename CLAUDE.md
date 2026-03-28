@@ -25,18 +25,24 @@ opencode-go --proxy --port 8080  # Modo proxy isolado
 
 **Modo proxy (`--proxy`):** sobe um servidor HTTP na porta 8080 que traduz requisições Anthropic ↔ OpenAI. O Claude Code aponta pra esse proxy via `ANTHROPIC_BASE_URL`.
 
-### Fluxo do proxy (o ponto central do projeto)
+### Fluxo do proxy — dois caminhos de conversão
 
+O proxy roteia automaticamente baseado no provider:
+
+**OpenCode Go (Chat Completions):**
 ```
-Claude Code
-  ↓ POST /v1/messages (Anthropic format)
-opencode-go proxy
-  ↓ convertAnthropicRequestToOpenAI() — mapeia system/messages/tools
-OpenCode Go API (OpenAI format)
-  ↓ streaming ou não
-opencode-go proxy
-  ↓ streamOpenAIToAnthropic() — SSE chunk-by-chunk OR convertOpenAIResponseToAnthropic()
-Claude Code
+Claude Code → POST /v1/messages (Anthropic)
+  → convertAnthropicRequestToOpenAI() → POST /v1/chat/completions
+  → streamOpenAIToAnthropic() ou convertOpenAIResponseToAnthropic()
+  → Claude Code
+```
+
+**OpenAI/Codex (Responses API):**
+```
+Claude Code → POST /v1/messages (Anthropic)
+  → convertAnthropicRequestToResponses() → POST /backend-api/codex/responses
+  → streamResponsesToAnthropic() ou convertResponsesApiToAnthropic()
+  → Claude Code
 ```
 
 ### Módulos
@@ -44,20 +50,33 @@ Claude Code
 | Arquivo | Responsabilidade |
 |---------|----------------|
 | `src/cli.ts` | Entry point, prompts interativos, spawn do Claude Code |
-| `src/proxy/server.ts` | Bun.serve + roteamento |
-| `src/proxy/request-conversion.ts` | Anthropic → OpenAI |
-| `src/proxy/response-conversion.ts` | OpenAI → Anthropic (non-stream) |
-| `src/proxy/stream-conversion.ts` | OpenAI SSE → Anthropic SSE (async generator) |
-| `src/logger.ts` | Logging com níveis DEBUG/INFO/WARN/ERROR |
+| `src/proxy/server.ts` | Bun.serve + roteamento dual (Chat Completions / Responses API) |
+| `src/proxy/request-conversion.ts` | Anthropic → OpenAI Chat Completions (OpenCode Go) |
+| `src/proxy/response-conversion.ts` | Chat Completions → Anthropic non-stream (OpenCode Go) |
+| `src/proxy/stream-conversion.ts` | Chat Completions SSE → Anthropic SSE (OpenCode Go) |
+| `src/proxy/request-conversion-responses.ts` | Anthropic → OpenAI Responses API (OpenAI/Codex) |
+| `src/proxy/response-conversion-responses.ts` | Responses API → Anthropic non-stream (OpenAI/Codex) |
+| `src/proxy/stream-conversion-responses.ts` | Responses API SSE → Anthropic SSE (OpenAI/Codex) |
+| `src/logger.ts` | Logging com níveis DEBUG/INFO/WARN/ERROR + silenciamento em modo embutido |
 | `src/env.ts` | buildClaudeEnv, cleanupClaudeCodeVars |
+| `src/auth/oauth.ts` | PKCE, exchange, refresh, JWT decode |
+| `src/auth/server.ts` | Servidor local OAuth callback (porta 1455) |
 
 ### Conversões importantes
 
-- `convertAnthropicRequestToOpenAI()` — traduz o formato Anthropic (`/v1/messages`) pro formato OpenAI (`/v1/chat/completions`). Cuida de: system prompt, conteúdo de imagens como `data:` URI, tool_results como mensagens `role: "tool"`, tool_use como `tool_calls`.
+**Chat Completions (provider: opencode):**
 
-- `streamOpenAIToAnthropic()` — gerador assíncrono que lê SSE do OpenAI e emite SSE do Anthropic chunk por chunk. Mantém estado de blocos (text, tool_use) com índices sequenciais. Envia eventos `message_start`, `content_block_start`, `content_block_delta`, `content_block_stop`, `message_delta`, `message_stop`.
+- `convertAnthropicRequestToOpenAI()` — traduz Anthropic (`/v1/messages`) → Chat Completions (`/v1/chat/completions`). System como `role: "system"`, tools com wrapper `function:{}`.
 
-- `convertOpenAIResponseToAnthropic()` — versão não-streaming da conversão acima.
+- `streamOpenAIToAnthropic()` — lê SSE sem eventos nomeados (`data: {"choices":[...]}`) e emite SSE Anthropic.
+
+**Responses API (provider: openai):**
+
+- `convertAnthropicRequestToResponses()` — traduz Anthropic → Responses API. System como `instructions` (top-level), mensagens como `input[]` tipado, tools flat sem wrapper, tool_results como `function_call_output`.
+
+- `streamResponsesToAnthropic()` — lê SSE com eventos nomeados (`event: response.output_text.delta`) e emite SSE Anthropic. Eventos: `response.created`, `response.output_text.delta`, `response.function_call_arguments.delta`, `response.completed`.
+
+- `convertResponsesApiToAnthropic()` / `convertOpenAIResponseToAnthropic()` — versões não-streaming das conversões.
 
 ### Variáveis de ambiente injetadas no Claude Code
 
@@ -71,7 +90,7 @@ Claude Code
 
 ### Config
 
-`~/.opencode-go-cli/config.json` — guarda apiKey, lastModel e proxyPort.
+`~/.opencode-go-cli/config.json` — guarda apiKey, provider, openaiTokens, lastModel e proxyPort.
 
 ### Servidor HTTP
 
@@ -81,5 +100,7 @@ Usa `Bun.serve` (não Node.js `http`). Isso é importante: o runtime é Bun, nã
 
 - **Bun como runtime** — o shebang é `#!/usr/bin/env bun`, o tsconfig usa `bun-types`. Não use APIs Node que não existam no Bun.
 - **SSE streaming** — a implementação de streaming é o coração do projeto. Qualquer alteração na conversão de blocos precisa respeitar o protocolo SSE do Anthropic (eventos nomeados, `data:` prefixado).
-- **Conversão de tool_calls** — o índice do bloco no Anthropic é sequencial (0, 1, 2...) mas no OpenAI pode começar em qualquer número. O código mantém `openaiToolIndexToBlockIndex` pra mapear.
+- **Dois formatos de SSE** — Chat Completions usa `data:` sem evento nomeado; Responses API usa `event: response.xxx` + `data:`. O proxy tem um stream converter pra cada formato.
+- **Conversão de tool_calls** — o índice do bloco no Anthropic é sequencial (0, 1, 2...) mas no OpenAI pode começar em qualquer número. O código mantém `openaiToolIndexToBlockIndex` (Chat Completions) ou `toolCallBlocks` (Responses API) pra mapear.
 - **Text block vs tool block** — se um tool_call aparecer, o text block que estava aberto precisa ser fechado antes do tool block começar. O código trata isso na ordem de chegada dos chunks.
+- **Logger silenciado em modo embutido** — quando o proxy roda junto com Claude Code, `silenceLogger()` é chamado antes de `startProxy()` pra não poluir o terminal interativo. No modo `--proxy` isolado, os logs aparecem normalmente.

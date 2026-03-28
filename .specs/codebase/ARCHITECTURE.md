@@ -7,19 +7,26 @@
 O código é dividido em módulos com responsabilidade clara:
 
 1. **CLI (`src/cli.ts`):** Parseia argumentos, prompts interativos, spawn do Claude Code
-2. **Proxy (`src/proxy/server.ts`):** Bun.serve que traduz requisições Anthropic ↔ OpenAI
-3. **Conversões (`src/proxy/request-conversion.ts`, `response-conversion.ts`, `stream-conversion.ts`):** Funções puras de transformação
+2. **Proxy (`src/proxy/server.ts`):** Bun.serve que roteia entre dois formatos de API baseado no provider
+3. **Conversões Chat Completions (`src/proxy/request-conversion.ts`, `response-conversion.ts`, `stream-conversion.ts`):** Funções puras — Anthropic ↔ Chat Completions (OpenCode Go)
+4. **Conversões Responses API (`src/proxy/*-responses.ts`):** Funções puras — Anthropic ↔ Responses API (OpenAI/Codex)
 
 ## Identified Patterns
 
-### Proxy Tradutor
+### Proxy Tradutor Dual
 
-**Location:** `src/proxy/request-conversion.ts`, `response-conversion.ts`, `stream-conversion.ts`
-**Purpose:** Traduzir requisições Anthropic → OpenAI e respostas OpenAI → Anthropic
-**Implementation:** Funções puras de transformação + Bun.serve como servidor HTTP
-**Streams:** `streamOpenAIToAnthropic()` é um async generator que converte SSE chunk por chunk
+**Location:** `src/proxy/server.ts` + dois conjuntos de conversores
+**Purpose:** Traduzir requisições Anthropic → OpenAI (Chat Completions ou Responses API) e respostas de volta
+**Implementation:** Funções puras de transformação + Bun.serve como servidor HTTP. O `server.ts` decide qual caminho usar com `const isResponses = provider === "openai"`.
+**Streams:** Dois async generators — `streamOpenAIToAnthropic()` (Chat Completions SSE) e `streamResponsesToAnthropic()` (Responses API SSE com eventos nomeados)
 
-O proxy é stateless entre requisições — cada requisição é transformada e enviada ao upstream OpenCode Go independentemente.
+O proxy é stateless entre requisições — cada requisição é transformada e enviada ao upstream independentemente.
+
+### Logger com Silenciamento
+
+**Location:** `src/logger.ts`
+**Purpose:** Logging com níveis + silenciamento em modo embutido
+**Implementation:** `silenceLogger()` é chamado antes de `startProxy()` quando o proxy roda junto com Claude Code (evita poluir o terminal interativo). No modo `--proxy` isolado, os logs aparecem normalmente.
 
 ### Configuração Persistente
 
@@ -62,67 +69,88 @@ Bun.serve.fetch(req)
   ├── HEAD/GET / → 200 OK (Claude Code connectivity check)
   └── POST /v1/messages
         ├── req.json() — parsing do body Anthropic
-        ├── convertAnthropicRequestToOpenAI() — transforma request
-        ├── fetch(OPENCODE_GO_ENDPOINT) — POST pro OpenCode Go API
-        ├── Se streaming:
-        │     └── streamOpenAIToAnthropic() — async generator, chunk por chunk
-        └── Se não-streaming:
-              └── convertOpenAIResponseToAnthropic() — transforma resposta completa
+        ├── isResponses = provider === "openai"
+        ├── Se OpenCode Go (Chat Completions):
+        │     ├── convertAnthropicRequestToOpenAI()
+        │     ├── fetch(OPENCODE_GO_ENDPOINT) → /v1/chat/completions
+        │     ├── streamOpenAIToAnthropic() ou convertOpenAIResponseToAnthropic()
+        └── Se OpenAI/Codex (Responses API):
+              ├── convertAnthropicRequestToResponses()
+              ├── fetch(CODEX_API_URL) → /backend-api/codex/responses
+              ├── streamResponsesToAnthropic() ou convertResponsesApiToAnthropic()
 ```
 
-### Fluxo de Conversão (Request)
+### Fluxo de Conversão — Chat Completions (OpenCode Go)
 
 ```
 Anthropic /v1/messages
-  ├── system: string | ContentBlock[] → role: "system"
-  ├── messages[].role: "user"
-  │     ├── content: string → role: "user", content: string
-  │     └── content: ContentBlock[]
-  │           ├── type: "text" → type: "text", text: string
-  │           ├── type: "image" → type: "image_url", image_url: { url: data:... }
-  │           └── type: "tool_result" → role: "tool", tool_call_id, content
-  ├── messages[].role: "assistant"
-  │     ├── content: string → role: "assistant", content: string
-  │     └── content: ContentBlock[]
-  │           ├── type: "text" → text
-  │           └── type: "tool_use" → tool_calls: [{ id, function: { name, arguments }}]
-  ├── tools[] → tools: [{ type: "function", function: { name, description, parameters }}]
-  └── tool_choice → tool_choice (required | auto | { type: "function", function: { name }})
-
+  ├── system → role: "system"
+  ├── messages[].role: "user" → role: "user"
+  │     ├── type: "text" → type: "text"
+  │     ├── type: "image" → type: "image_url" (data: URI)
+  │     └── type: "tool_result" → role: "tool", tool_call_id
+  ├── messages[].role: "assistant" → role: "assistant"
+  │     └── type: "tool_use" → tool_calls: [{ function: { name, arguments }}]
+  └── tools[] → [{ type: "function", function: { name, parameters }}]
 → OpenAI /v1/chat/completions
 ```
 
-### Fluxo de Conversão (Response Streaming)
+### Fluxo de Conversão — Responses API (OpenAI/Codex)
 
 ```
-OpenAI SSE
-  └── data: {"choices": [{"delta": {"content": "..."}}]}
-        └── event: content_block_start (type: "text")
-        └── event: content_block_delta (type: "text_delta", text: "...")
-        └── event: content_block_stop (index: N)
-        └── event: message_delta (stop_reason: "end_turn")
-        └── event: message_stop
+Anthropic /v1/messages
+  ├── system → instructions (campo top-level)
+  ├── messages[].role: "user" → input[].type: "message" (content: input_text)
+  │     └── type: "tool_result" → input[].type: "function_call_output"
+  ├── messages[].role: "assistant" → input[].type: "message" (content: output_text)
+  │     └── type: "tool_use" → input[].type: "function_call"
+  └── tools[] → [{ type: "function", name, parameters }] (flat, sem wrapper)
+→ OpenAI /backend-api/codex/responses
 ```
 
-Estado interno do stream: mantém `textBlockStarted`, `toolCallAccumulators`, `openaiToolIndexToBlockIndex` para mapear índices OpenAI → Anthropic.
+### Streaming — Chat Completions SSE
+
+```
+data: {"choices": [{"delta": {"content": "..."}}]}
+  → event: content_block_delta (type: "text_delta")
+data: [DONE]
+  → event: message_stop
+```
+Estado: `textBlockStarted`, `toolCallAccumulators`, `openaiToolIndexToBlockIndex`
+
+### Streaming — Responses API SSE
+
+```
+event: response.output_text.delta → content_block_delta (text_delta)
+event: response.function_call_arguments.delta → content_block_delta (input_json_delta)
+event: response.output_item.added (function_call) → content_block_start (tool_use)
+event: response.completed → message_delta + message_stop
+```
+Estado: `textBlockStarted`, `textBlockIndex`, `toolCallBlocks` (item_id → blockIndex)
 
 ## Code Organization
 
 ```
 src/
-├── constants.ts        # MODELS, ENDPOINT, CONFIG_DIR, CONFIG_FILE, DEFAULT_PROXY_PORT
+├── constants.ts        # MODELS, OPENAI_MODELS, PROVIDERS, ENDPOINTS, OAuth constants
 ├── config.ts           # getConfig, saveConfig, deleteConfig
 ├── path.ts            # resolveClaudePath
 ├── env.ts             # buildClaudeEnv, cleanupClaudeCodeVars
-├── logger.ts          # createLogger (DEBUG/INFO/WARN/ERROR)
-├── cli.ts             # main(), setupApiKey(), selectModel(), runClaudeCode()
+├── logger.ts          # createLogger (DEBUG/INFO/WARN/ERROR) + silenceLogger()
+├── cli.ts             # main(), setupApiKey(), selectModel(), runClaudeCode(), setupOpenAIOAuth()
+├── auth/
+│   ├── oauth.ts       # createAuthorizationFlow, exchangeAuthorizationCode, refreshAccessToken
+│   └── server.ts      # startLocalOAuthServer (porta 1455)
 └── proxy/
-    ├── types.ts        # Config, Model interfaces
-    ├── helpers.ts      # mapStopReason, generateMsgId, convertImageSource, formatDelta
-    ├── request-conversion.ts
-    ├── response-conversion.ts
-    ├── stream-conversion.ts
-    └── server.ts       # startProxy() + Bun.serve
+    ├── types.ts                          # Config, Model interfaces
+    ├── helpers.ts                        # mapStopReason, generateMsgId, convertImageSource, makeSSE
+    ├── request-conversion.ts             # Anthropic → Chat Completions (OpenCode Go)
+    ├── response-conversion.ts            # Chat Completions → Anthropic (OpenCode Go)
+    ├── stream-conversion.ts              # Chat Completions SSE → Anthropic SSE (OpenCode Go)
+    ├── request-conversion-responses.ts   # Anthropic → Responses API (OpenAI/Codex)
+    ├── response-conversion-responses.ts  # Responses API → Anthropic (OpenAI/Codex)
+    ├── stream-conversion-responses.ts    # Responses API SSE → Anthropic SSE (OpenAI/Codex)
+    └── server.ts                         # startProxy() + Bun.serve + dual routing
 ```
 
 **Module boundaries:**
@@ -131,9 +159,10 @@ src/
 - `config.ts` — depende de constants
 - `path.ts` — depende de constants
 - `env.ts` — depende de constants
-- `logger.ts` — depende de constants
+- `logger.ts` — sem dependências
+- `auth/oauth.ts` — depende de constants
+- `auth/server.ts` — sem dependências externas
 - `cli.ts` — orchestrator (importa tudo)
-- `proxy/types.ts` — sem dependências
 - `proxy/helpers.ts` — sem dependências
-- `proxy/*.ts` — dependem de types e helpers
-- `proxy/server.ts` — imports de proxy modules + logger
+- `proxy/*-conversion*.ts` — dependem de helpers
+- `proxy/server.ts` — imports de todos os proxy modules + logger + auth/oauth

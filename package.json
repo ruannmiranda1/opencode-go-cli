@@ -14,7 +14,8 @@
     "start": "bun run src/index.ts"
   },
   "dependencies": {
-    "@clack/prompts": "^0.7.0"
+    "@clack/prompts": "^0.7.0",
+    "@openauthjs/openauth": "^0.4.3"
   },
   "devDependencies": {
     "@types/bun": "latest",
