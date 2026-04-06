@@ -413,9 +413,13 @@ async function runClaudeCode(
   spinner.stop(`Launching Claude Code with ${model}`);
 
   return new Promise<number>((resolve) => {
-    const child = spawn(claudePath, spawnArgs, {
+    const isWin = process.platform === "win32";
+    const executable = isWin ? `"${claudePath}"` : claudePath;
+
+    const child = spawn(executable, spawnArgs, {
       stdio: "inherit",
       env,
+      shell: isWin,
     });
 
     child.on("error", (err) => {
